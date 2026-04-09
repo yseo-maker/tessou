@@ -333,33 +333,199 @@ function showResult() {
   }, 400);
 }
 
+// ===================== MEDIAPIPE HAND DETECTION =====================
+let handsInstance = null;
+let landmarkPending = null;
+let detectedLandmarkPaths = null; // landmark-based paths, null = use fallback
+
+async function getHandsInstance() {
+  if (handsInstance) return handsInstance;
+  const h = new Hands({
+    locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+  });
+  h.setOptions({ maxNumHands:1, modelComplexity:1, minDetectionConfidence:0.5, minTrackingConfidence:0.5 });
+  h.onResults(results => {
+    if (landmarkPending) {
+      landmarkPending(results.multiHandLandmarks && results.multiHandLandmarks.length > 0
+        ? results.multiHandLandmarks[0] : null);
+      landmarkPending = null;
+    }
+  });
+  await h.initialize();
+  handsInstance = h;
+  return h;
+}
+
+async function detectLandmarks(imgEl) {
+  try {
+    const h = await getHandsInstance();
+    return await new Promise(resolve => {
+      landmarkPending = resolve;
+      h.send({ image: imgEl });
+    });
+  } catch(e) {
+    return null;
+  }
+}
+
+// ===================== LANDMARK → LINE PATHS =====================
+function lerp(a, b, t) { return { x: a.x+(b.x-a.x)*t, y: a.y+(b.y-a.y)*t }; }
+
+function calcLandmarkPaths(lm, cw, ch) {
+  // Convert normalized coords to pixels
+  const p = lm.map(l => ({ x: l.x*cw, y: l.y*ch }));
+  // Landmarks: 0=wrist,1=thumb_cmc,2=thumb_mcp,3=thumb_ip,4=thumb_tip
+  //   5=idx_mcp,9=mid_mcp,13=ring_mcp,17=pinky_mcp
+  //   (higher = fingertips)
+
+  const palmH = Math.abs(p[0].y - p[9].y);
+
+  // Determine hand orientation (is palm facing us, or mirrored?)
+  // If idx_mcp.x < pinky_mcp.x → right hand palm-up (normal)
+  const flip = p[5].x > p[17].x; // left hand or mirrored image
+
+  const edgeX = flip
+    ? Math.min(p[17].x, p[5].x) - palmH*0.1
+    : Math.max(p[17].x, p[5].x) + palmH*0.1;
+
+  // ── 生命線 (Life) ──
+  // Starts between thumb root and index base, arcs around thumb mount, ends near wrist
+  const lifeOrigin = lerp(p[2], p[5], 0.45);
+  const lifeCtrl   = { x: p[1].x + (p[0].x-p[1].x)*0.1, y: lerp(p[1],p[0],0.3).y };
+  const lifeMid    = { x: p[1].x - (flip?-1:1)*palmH*0.08, y: lerp(p[1],p[0],0.55).y };
+  const lifeEnd    = lerp(p[0], p[1], 0.15);
+
+  // ── 感情線 (Heart) ──
+  // Across upper palm, ~15% below finger bases
+  const hOff = palmH * 0.14;
+  const heartPts = [
+    { x: flip ? p[17].x+palmH*0.12 : p[17].x-palmH*0.12, y: p[17].y + hOff },
+    { x: p[13].x, y: p[13].y + hOff*0.7 },
+    { x: p[9].x,  y: p[9].y  + hOff*0.8 },
+    { x: p[5].x,  y: p[5].y  + hOff*1.1 },
+  ];
+
+  // ── 知能線 (Head) ──
+  // From near life line origin, goes across palm at ~38% from fingers
+  const headY  = p[9].y + palmH * 0.38;
+  const headPts = [
+    { x: lifeOrigin.x, y: lifeOrigin.y + palmH*0.15 },
+    { x: lerp(p[5],p[9],0.5).x, y: headY },
+    { x: flip ? p[17].x+palmH*0.05 : p[17].x-palmH*0.05, y: headY + palmH*0.04 },
+  ];
+
+  // ── 運命線 (Fate) ──
+  // Center vertical from wrist to middle finger base
+  const fateX = lerp(p[0],p[9],0.5).x;
+  const fatePts = [
+    { x: lerp(p[0],{x:fateX,y:p[0].y},1).x, y: p[0].y - palmH*0.05 },
+    { x: fateX, y: lerp(p[0],p[9],0.5).y },
+    { x: p[9].x, y: p[9].y + palmH*0.08 },
+  ];
+
+  // ── 太陽線 (Sun) ──
+  // Near ring finger, short vertical
+  const sunPts = [
+    { x: p[13].x, y: p[13].y + palmH*0.1 },
+    { x: p[13].x, y: p[13].y + palmH*0.55 },
+  ];
+
+  // ── 結婚線 (Marriage) ──
+  // Small horizontal near pinky, upper palm edge
+  const marY  = lerp(p[17],p[5],0.14).y;
+  const marOff = palmH*0.18;
+  const marPts = [
+    { x: flip ? p[17].x+marOff : p[17].x-marOff, y: marY },
+    { x: flip ? p[17].x+marOff*0.4 : p[17].x-marOff*0.4, y: marY },
+  ];
+
+  // ── 金運線 (Money) ──
+  const monX = lerp(p[9],p[13],0.5).x;
+  const monPts = [
+    { x: monX, y: p[9].y + palmH*0.35 },
+    { x: monX + (p[13].x-p[9].x)*0.05, y: p[9].y + palmH*0.72 },
+  ];
+
+  // ── 人気線 (Popular) ──
+  const popX = lerp(p[13],p[17],0.35).x;
+  const popPts = [
+    { x: popX, y: p[13].y + palmH*0.12 },
+    { x: popX, y: p[13].y + palmH*0.45 },
+  ];
+
+  // ── モテ線 (Charm) ──
+  const charmX = lerp(p[5],p[9],0.35).x;
+  const charmPts = [
+    { x: charmX, y: p[5].y + palmH*0.28 },
+    { x: charmX - (flip?-1:1)*palmH*0.04, y: p[5].y + palmH*0.5 },
+  ];
+
+  // ── つくし線 (Devotion) ──
+  const devPts = [
+    lerp(p[1], p[5], 0.28),
+    lerp(lerp(p[1],p[5],0.5), p[0], 0.2),
+  ];
+  devPts[0].y += palmH*0.1;
+  devPts[1].y += palmH*0.1;
+
+  return {
+    life:     [lifeOrigin, lifeCtrl, lifeMid, lifeEnd],
+    heart:    heartPts,
+    head:     headPts,
+    fate:     fatePts,
+    sun:      sunPts,
+    marriage: marPts,
+    money:    monPts,
+    popular:  popPts,
+    charm:    charmPts,
+    devotion: devPts,
+  };
+}
+
 // ===================== CANVAS =====================
 function drawCanvas() {
   const canvas = document.getElementById('palmCanvas');
   const ctx = canvas.getContext('2d');
   const img = new Image();
-  img.onload = () => {
+
+  img.onload = async () => {
     const maxW = Math.min(img.width, 800);
     const scale = maxW / img.width;
-    canvas.width = img.width * scale;
+    canvas.width  = img.width  * scale;
     canvas.height = img.height * scale;
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-    PALM_LINES.forEach((l, i) => setTimeout(() => { if (lineVis[l.id]) drawLine(ctx, l, canvas.width, canvas.height); }, i * 120));
+
+    // Try landmark detection
+    const lm = await detectLandmarks(img);
+    if (lm) {
+      detectedLandmarkPaths = calcLandmarkPaths(lm, canvas.width, canvas.height);
+    } else {
+      detectedLandmarkPaths = null; // use fallback
+    }
+
+    PALM_LINES.forEach((l, i) =>
+      setTimeout(() => { if (lineVis[l.id]) drawLine(ctx, l, canvas.width, canvas.height); }, i * 100)
+    );
     buildLegend();
   };
   img.src = imgSrc;
 }
 
 function drawLine(ctx, line, cw, ch) {
-  const pts = line.path.map(([x,y]) => ({ x: x/100*cw, y: y/100*ch }));
+  // Use landmark-based path if available, otherwise fallback to fixed %
+  const pts = detectedLandmarkPaths && detectedLandmarkPaths[line.id]
+    ? detectedLandmarkPaths[line.id]
+    : line.path.map(([x,y]) => ({ x: x/100*cw, y: y/100*ch }));
+
   ctx.save();
   ctx.strokeStyle = '#ff3333';
   ctx.lineWidth = Math.max(2.5, cw / 180);
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  ctx.shadowColor = 'rgba(255,50,50,0.65)';
-  ctx.shadowBlur = 10;
+  ctx.shadowColor = 'rgba(255,50,50,0.7)';
+  ctx.shadowBlur = 12;
   ctx.setLineDash(line.dash || []);
+
   ctx.beginPath();
   ctx.moveTo(pts[0].x, pts[0].y);
   if (pts.length === 2) {
@@ -375,19 +541,19 @@ function drawLine(ctx, line, cw, ch) {
   }
   ctx.stroke();
 
-  // Label
+  // Label at last point
   const last = pts[pts.length-1];
   ctx.setLineDash([]);
   ctx.shadowBlur = 0;
   const fs = Math.max(9, cw / 80);
   ctx.font = `bold ${fs}px sans-serif`;
   const tw = ctx.measureText(line.name).width;
-  ctx.fillStyle = 'rgba(0,0,0,0.7)';
-  ctx.fillRect(last.x - tw/2 - 3, last.y - fs - 2, tw + 6, fs + 4);
+  ctx.fillStyle = 'rgba(0,0,0,0.72)';
+  ctx.fillRect(last.x - tw/2 - 3, last.y - fs - 2, tw + 6, fs + 6);
   ctx.fillStyle = '#ffbbbb';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'alphabetic';
-  ctx.fillText(line.name, last.x, last.y);
+  ctx.fillText(line.name, last.x, last.y + 1);
   ctx.restore();
 }
 
@@ -396,9 +562,11 @@ function redrawCanvas() {
   const ctx = canvas.getContext('2d');
   const img = new Image();
   img.onload = () => {
-    ctx.clearRect(0,0,canvas.width,canvas.height);
-    ctx.drawImage(img,0,0,canvas.width,canvas.height);
-    PALM_LINES.forEach((l,i) => setTimeout(() => { if (lineVis[l.id]) drawLine(ctx,l,canvas.width,canvas.height); }, i*80));
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    PALM_LINES.forEach((l, i) =>
+      setTimeout(() => { if (lineVis[l.id]) drawLine(ctx, l, canvas.width, canvas.height); }, i * 80)
+    );
   };
   img.src = imgSrc;
 }
@@ -611,6 +779,7 @@ function resetToUpload() {
   lineVis = {};
   scores = {};
   readingTexts = {};
+  detectedLandmarkPaths = null;
 }
 
 // ===================== LOADING =====================
