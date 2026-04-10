@@ -237,7 +237,19 @@ function setupUpload() {
   document.getElementById('retakeBtn').addEventListener('click', resetToUpload);
 }
 
-function loadFile(file) {
+async function loadFile(file) {
+  // HEIC/HEIF → JPEG 自動変換（Safari以外のブラウザ対応）
+  const isHeic = file.type === 'image/heic' || file.type === 'image/heif'
+    || /\.(heic|heif)$/i.test(file.name);
+  if (isHeic) {
+    try {
+      const converted = await heic2any({ blob: file, toType: 'image/jpeg', quality: 0.92 });
+      file = Array.isArray(converted) ? converted[0] : converted;
+    } catch(e) {
+      alert('HEIC画像の変換に失敗しました。\n写真をJPEGまたはPNGに変換してからお試しください。');
+      return;
+    }
+  }
   if (!file.type.startsWith('image/')) return;
   const reader = new FileReader();
   reader.onload = e => { imgSrc = e.target.result; runAnalysis(); };
@@ -548,6 +560,9 @@ function drawCanvas() {
   const ctx = canvas.getContext('2d');
   const img = new Image();
 
+  img.onerror = () => {
+    alert('画像を読み込めませんでした。\nJPEGまたはPNG形式の写真をお試しください。');
+  };
   img.onload = async () => {
     const maxW = Math.min(img.width, 800);
     const scale = maxW / img.width;
