@@ -324,43 +324,48 @@ function setupUpload() {
 }
 
 async function loadFile(file) {
-  // MIME型が空でも拡張子で判断（iOS等でtype未設定になる場合がある）
-  const ext = (file.name || '').split('.').pop().toLowerCase();
-  const knownImg = /^(jpe?g|png|webp|gif|bmp|avif|heic|heif)$/.test(ext);
-  if (!file.type.startsWith('image/') && !knownImg) return;
+  try {
+    // MIME型が空でも拡張子で画像か判断
+    const ext = (file.name || '').split('.').pop().toLowerCase();
+    const knownImg = /^(jpe?g|png|webp|gif|bmp|avif|heic|heif|tiff?)$/.test(ext);
+    if (!file.type.startsWith('image/') && !knownImg) return;
 
-  const isHeic = file.type === 'image/heic' || file.type === 'image/heif'
-    || /\.(heic|heif)$/i.test(file.name);
+    const isHeic = file.type === 'image/heic' || file.type === 'image/heif'
+      || /\.(heic|heif)$/i.test(file.name || '');
 
-  let objUrl = URL.createObjectURL(file);
+    let objUrl = URL.createObjectURL(file);
 
-  if (isHeic) {
-    // 1) まずブラウザのネイティブ HEIC 対応を試みる（Safari では不要な変換をしない）
-    const canLoadNative = await new Promise(resolve => {
-      const t = new Image();
-      const timer = setTimeout(() => { t.src = ''; resolve(false); }, 4000);
-      t.onload  = () => { clearTimeout(timer); resolve(true); };
-      t.onerror = () => { clearTimeout(timer); resolve(false); };
-      t.src = objUrl;
-    });
+    if (isHeic) {
+      // まずブラウザのネイティブ HEIC 対応を試みる（Safari はネイティブで対応）
+      const canLoadNative = await new Promise(resolve => {
+        const t = new Image();
+        const timer = setTimeout(() => resolve(false), 5000);
+        t.onload  = () => { clearTimeout(timer); resolve(true); };
+        t.onerror = () => { clearTimeout(timer); resolve(false); };
+        t.src = objUrl;
+      });
 
-    if (!canLoadNative) {
-      // 2) ネイティブ非対応 → heic2any で JPEG 変換
-      URL.revokeObjectURL(objUrl);
-      try {
+      if (!canLoadNative) {
+        // ネイティブ非対応 → heic2any で JPEG 変換
+        URL.revokeObjectURL(objUrl);
+        if (typeof heic2any === 'undefined') {
+          alert('ページを再読み込みしてからお試しください。');
+          return;
+        }
         const converted = await heic2any({ blob: file, toType: 'image/jpeg', quality: 0.88 });
         const blob = Array.isArray(converted) ? converted[0] : converted;
         objUrl = URL.createObjectURL(blob);
-      } catch(e) {
-        alert('HEIC画像を読み込めませんでした。\nカメラロールから写真を選ぶか、JPEGに変換してからお試しください。');
-        return;
       }
     }
-  }
 
-  if (imgSrc && imgSrc.startsWith('blob:')) URL.revokeObjectURL(imgSrc);
-  imgSrc = objUrl;
-  runAnalysis();
+    if (imgSrc && imgSrc.startsWith('blob:')) URL.revokeObjectURL(imgSrc);
+    imgSrc = objUrl;
+    runAnalysis();
+
+  } catch(err) {
+    console.error('loadFile error:', err);
+    alert('写真の読み込みに失敗しました。\n別の写真か、JPEGに変換してお試しください。\nエラー: ' + (err.message || String(err)));
+  }
 }
 
 // ===================== ANALYSIS =====================
