@@ -333,21 +333,18 @@ function showResult() {
   }, 400);
 }
 
-// ===================== MEDIAPIPE HAND DETECTION =====================
+// ===================== MEDIAPIPE =====================
 let handsInstance = null;
 let landmarkPending = null;
-let detectedLandmarkPaths = null; // landmark-based paths, null = use fallback
+let detectedLandmarkPaths = null;
 
 async function getHandsInstance() {
   if (handsInstance) return handsInstance;
-  const h = new Hands({
-    locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
-  });
+  const h = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
   h.setOptions({ maxNumHands:1, modelComplexity:1, minDetectionConfidence:0.5, minTrackingConfidence:0.5 });
-  h.onResults(results => {
+  h.onResults(r => {
     if (landmarkPending) {
-      landmarkPending(results.multiHandLandmarks && results.multiHandLandmarks.length > 0
-        ? results.multiHandLandmarks[0] : null);
+      landmarkPending(r.multiHandLandmarks?.length ? r.multiHandLandmarks[0] : null);
       landmarkPending = null;
     }
   });
@@ -359,127 +356,160 @@ async function getHandsInstance() {
 async function detectLandmarks(imgEl) {
   try {
     const h = await getHandsInstance();
-    return await new Promise(resolve => {
-      landmarkPending = resolve;
-      h.send({ image: imgEl });
-    });
-  } catch(e) {
-    return null;
-  }
+    return await new Promise(resolve => { landmarkPending = resolve; h.send({ image: imgEl }); });
+  } catch(e) { return null; }
 }
 
-// ===================== LANDMARK → LINE PATHS =====================
+// ===================== IMAGE ANALYSIS =====================
 function lerp(a, b, t) { return { x: a.x+(b.x-a.x)*t, y: a.y+(b.y-a.y)*t }; }
 
-function calcLandmarkPaths(lm, cw, ch) {
-  // Convert normalized coords to pixels
-  const p = lm.map(l => ({ x: l.x*cw, y: l.y*ch }));
-  // Landmarks: 0=wrist,1=thumb_cmc,2=thumb_mcp,3=thumb_ip,4=thumb_tip
-  //   5=idx_mcp,9=mid_mcp,13=ring_mcp,17=pinky_mcp
-  //   (higher = fingertips)
+function getGrayData(canvas) {
+  const {width:W, height:H} = canvas;
+  const px = canvas.getContext('2d').getImageData(0,0,W,H).data;
+  const g = new Float32Array(W*H);
+  for (let i=0; i<g.length; i++) g[i] = 0.299*px[i*4] + 0.587*px[i*4+1] + 0.114*px[i*4+2];
+  return g;
+}
+
+// Find y-row with lowest mean brightness in a region (= crease location)
+function darkestRow(g, W, H, x0, x1, y0, y1) {
+  x0=Math.max(0,~~x0); x1=Math.min(W,~~x1);
+  y0=Math.max(0,~~y0); y1=Math.min(H,~~y1);
+  if (y0>=y1||x0>=x1) return ~~((y0+y1)/2);
+  let bestY=~~((y0+y1)/2), best=Infinity;
+  for (let py=y0; py<y1; py++) {
+    let s=0, n=0;
+    for (let px=x0; px<x1; px++) { s+=g[py*W+px]; n++; }
+    const v=s/n;
+    if (v<best) { best=v; bestY=py; }
+  }
+  return bestY;
+}
+
+// Find x-column with lowest mean brightness (= crease location)
+function darkestCol(g, W, H, x0, x1, y0, y1) {
+  x0=Math.max(0,~~x0); x1=Math.min(W,~~x1);
+  y0=Math.max(0,~~y0); y1=Math.min(H,~~y1);
+  if (y0>=y1||x0>=x1) return ~~((x0+x1)/2);
+  let bestX=~~((x0+x1)/2), best=Infinity;
+  for (let px=x0; px<x1; px++) {
+    let s=0, n=0;
+    for (let py=y0; py<y1; py++) { s+=g[py*W+px]; n++; }
+    const v=s/n;
+    if (v<best) { best=v; bestX=px; }
+  }
+  return bestX;
+}
+
+// ===================== CREASE PATH DETECTION =====================
+function calcCreasePaths(lm, canvas) {
+  const W=canvas.width, H=canvas.height;
+  const p=lm.map(l=>({x:l.x*W, y:l.y*H}));
+  const g=getGrayData(canvas);
+  const lr=lerp;
 
   const palmH = Math.abs(p[0].y - p[9].y);
+  const palmW_half = palmH * 0.45;
 
-  // Determine hand orientation (is palm facing us, or mirrored?)
-  // If idx_mcp.x < pinky_mcp.x → right hand palm-up (normal)
-  const flip = p[5].x > p[17].x; // left hand or mirrored image
+  // Palm geometry
+  const fingerBaseY = Math.min(p[5].y, p[9].y, p[13].y, p[17].y);
+  const wristY = p[0].y;
+  const centerX = p[9].x;
 
-  const edgeX = flip
-    ? Math.min(p[17].x, p[5].x) - palmH*0.1
-    : Math.max(p[17].x, p[5].x) + palmH*0.1;
+  // Is this a right or left hand? (index finger side)
+  const flip = p[5].x > p[17].x;
+  const thumbX = flip ? Math.max(p[1].x,p[2].x) : Math.min(p[1].x,p[2].x);
+  const pinkyX = flip ? Math.min(p[17].x) : Math.max(p[17].x);
+  const xLeft  = Math.min(thumbX, pinkyX) - palmH*0.02;
+  const xRight = Math.max(thumbX, pinkyX) + palmH*0.02;
+  const palmW  = xRight - xLeft;
 
-  // ── 生命線 (Life) ──
-  // Starts between thumb root and index base, arcs around thumb mount, ends near wrist
-  const lifeOrigin = lerp(p[2], p[5], 0.45);
-  const lifeCtrl   = { x: p[1].x + (p[0].x-p[1].x)*0.1, y: lerp(p[1],p[0],0.3).y };
-  const lifeMid    = { x: p[1].x - (flip?-1:1)*palmH*0.08, y: lerp(p[1],p[0],0.55).y };
-  const lifeEnd    = lerp(p[0], p[1], 0.15);
+  // ── 感情線 Heart ── scan rows in top 22% of palm, multi-section
+  const heartPts = [];
+  const hSeg = 5;
+  for (let i=0; i<=hSeg; i++) {
+    const xC = xLeft + palmW*(i/hSeg);
+    const hw  = palmW/hSeg * 0.9;
+    const y = darkestRow(g, W, H, xC-hw, xC+hw, fingerBaseY, fingerBaseY+palmH*0.22);
+    heartPts.push({x:xC, y});
+  }
 
-  // ── 感情線 (Heart) ──
-  // Across upper palm, ~15% below finger bases
-  const hOff = palmH * 0.14;
-  const heartPts = [
-    { x: flip ? p[17].x+palmH*0.12 : p[17].x-palmH*0.12, y: p[17].y + hOff },
-    { x: p[13].x, y: p[13].y + hOff*0.7 },
-    { x: p[9].x,  y: p[9].y  + hOff*0.8 },
-    { x: p[5].x,  y: p[5].y  + hOff*1.1 },
-  ];
+  // ── 知能線 Head ── scan rows 22–46% of palm
+  const headPts = [];
+  const dSeg = 4;
+  for (let i=0; i<=dSeg; i++) {
+    const xC = xLeft + palmW*(i/dSeg);
+    const hw  = palmW/dSeg * 0.9;
+    const y = darkestRow(g, W, H, xC-hw, xC+hw, fingerBaseY+palmH*0.21, fingerBaseY+palmH*0.46);
+    headPts.push({x:xC, y});
+  }
 
-  // ── 知能線 (Head) ──
-  // From near life line origin, goes across palm at ~38% from fingers
-  const headY  = p[9].y + palmH * 0.38;
-  const headPts = [
-    { x: lifeOrigin.x, y: lifeOrigin.y + palmH*0.15 },
-    { x: lerp(p[5],p[9],0.5).x, y: headY },
-    { x: flip ? p[17].x+palmH*0.05 : p[17].x-palmH*0.05, y: headY + palmH*0.04 },
-  ];
+  // ── 生命線 Life ── scan columns near thumb side, from top to wrist
+  const lifeOriginY = lr(p[2],p[5],0.4).y;
+  const lifePts = [];
+  for (let i=0; i<5; i++) {
+    const t = i/4;
+    const scanY = lifeOriginY + (wristY - lifeOriginY)*t;
+    const xCtr  = thumbX + (centerX - thumbX)*0.25;
+    const xRange = palmW * 0.26;
+    const x = darkestCol(g, W, H, xCtr-xRange, xCtr+xRange, scanY-palmH*0.06, scanY+palmH*0.06);
+    lifePts.push({x, y:scanY});
+  }
 
-  // ── 運命線 (Fate) ──
-  // Center vertical from wrist to middle finger base
-  const fateX = lerp(p[0],p[9],0.5).x;
-  const fatePts = [
-    { x: lerp(p[0],{x:fateX,y:p[0].y},1).x, y: p[0].y - palmH*0.05 },
-    { x: fateX, y: lerp(p[0],p[9],0.5).y },
-    { x: p[9].x, y: p[9].y + palmH*0.08 },
-  ];
+  // ── 運命線 Fate ── scan columns in center, from wrist to finger base
+  const fatePts = [];
+  for (let i=0; i<4; i++) {
+    const t = i/3;
+    const scanY = wristY + (fingerBaseY - wristY)*t;
+    const xRange = palmW * 0.16;
+    const x = darkestCol(g, W, H, centerX-xRange, centerX+xRange, scanY-palmH*0.08, scanY+palmH*0.08);
+    fatePts.push({x, y:scanY});
+  }
 
-  // ── 太陽線 (Sun) ──
-  // Near ring finger, short vertical
+  // ── 太陽線 Sun ── near ring finger, short vertical
   const sunPts = [
-    { x: p[13].x, y: p[13].y + palmH*0.1 },
-    { x: p[13].x, y: p[13].y + palmH*0.55 },
+    {x:p[13].x, y:p[13].y+palmH*0.1},
+    {x:p[13].x, y:p[13].y+palmH*0.52}
   ];
 
-  // ── 結婚線 (Marriage) ──
-  // Small horizontal near pinky, upper palm edge
-  const marY  = lerp(p[17],p[5],0.14).y;
-  const marOff = palmH*0.18;
+  // ── 結婚線 Marriage ── small horizontal, pinky edge
+  const marY   = lr(p[17],p[5],0.13).y;
+  const marOff = palmW*0.2;
   const marPts = [
-    { x: flip ? p[17].x+marOff : p[17].x-marOff, y: marY },
-    { x: flip ? p[17].x+marOff*0.4 : p[17].x-marOff*0.4, y: marY },
+    {x: flip ? p[17].x+marOff : p[17].x-marOff, y:marY},
+    {x: flip ? p[17].x+marOff*0.35 : p[17].x-marOff*0.35, y:marY}
   ];
 
-  // ── 金運線 (Money) ──
-  const monX = lerp(p[9],p[13],0.5).x;
+  // ── 金運線 Money ── between fate and sun
+  const monX = lr(p[9],p[13],0.48).x;
   const monPts = [
-    { x: monX, y: p[9].y + palmH*0.35 },
-    { x: monX + (p[13].x-p[9].x)*0.05, y: p[9].y + palmH*0.72 },
+    {x:monX, y:fingerBaseY+palmH*0.3},
+    {x:monX, y:fingerBaseY+palmH*0.68}
   ];
 
-  // ── 人気線 (Popular) ──
-  const popX = lerp(p[13],p[17],0.35).x;
+  // ── 人気線 Popular ── ring-pinky side
+  const popX = lr(p[13],p[17],0.4).x;
   const popPts = [
-    { x: popX, y: p[13].y + palmH*0.12 },
-    { x: popX, y: p[13].y + palmH*0.45 },
+    {x:popX, y:fingerBaseY+palmH*0.13},
+    {x:popX, y:fingerBaseY+palmH*0.4}
   ];
 
-  // ── モテ線 (Charm) ──
-  const charmX = lerp(p[5],p[9],0.35).x;
+  // ── モテ線 Charm ── index-middle side
+  const chX = lr(p[5],p[9],0.28).x;
   const charmPts = [
-    { x: charmX, y: p[5].y + palmH*0.28 },
-    { x: charmX - (flip?-1:1)*palmH*0.04, y: p[5].y + palmH*0.5 },
+    {x:chX, y:fingerBaseY+palmH*0.27},
+    {x:chX-(flip?-1:1)*palmH*0.03, y:fingerBaseY+palmH*0.5}
   ];
 
-  // ── つくし線 (Devotion) ──
+  // ── つくし線 Devotion ── near life line upper
   const devPts = [
-    lerp(p[1], p[5], 0.28),
-    lerp(lerp(p[1],p[5],0.5), p[0], 0.2),
+    {x:lr(p[1],p[5],0.22).x, y:fingerBaseY+palmH*0.43},
+    {x:lr(p[1],p[5],0.4).x,  y:fingerBaseY+palmH*0.6}
   ];
-  devPts[0].y += palmH*0.1;
-  devPts[1].y += palmH*0.1;
 
-  return {
-    life:     [lifeOrigin, lifeCtrl, lifeMid, lifeEnd],
-    heart:    heartPts,
-    head:     headPts,
-    fate:     fatePts,
-    sun:      sunPts,
-    marriage: marPts,
-    money:    monPts,
-    popular:  popPts,
-    charm:    charmPts,
-    devotion: devPts,
-  };
+  return { life:lifePts, heart:heartPts, head:headPts, fate:fatePts,
+           sun:sunPts, marriage:marPts, money:monPts, popular:popPts,
+           charm:charmPts, devotion:devPts };
 }
 
 // ===================== CANVAS =====================
@@ -495,13 +525,10 @@ function drawCanvas() {
     canvas.height = img.height * scale;
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-    // Try landmark detection
+    // 1) Detect hand landmarks
     const lm = await detectLandmarks(img);
-    if (lm) {
-      detectedLandmarkPaths = calcLandmarkPaths(lm, canvas.width, canvas.height);
-    } else {
-      detectedLandmarkPaths = null; // use fallback
-    }
+    // 2) If found: run image-analysis crease detection
+    detectedLandmarkPaths = lm ? calcCreasePaths(lm, canvas) : null;
 
     PALM_LINES.forEach((l, i) =>
       setTimeout(() => { if (lineVis[l.id]) drawLine(ctx, l, canvas.width, canvas.height); }, i * 100)
