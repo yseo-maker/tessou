@@ -324,25 +324,42 @@ function setupUpload() {
 }
 
 async function loadFile(file) {
-  // HEIC/HEIF → JPEG 自動変換（Safari以外のブラウザ対応）
-  const isHeic = file.type === 'image/heic' || file.type === 'image/heif'
-    || /\.(heic|heif)$/i.test(file.name);
-  if (isHeic) {
-    try {
-      const converted = await heic2any({ blob: file, toType: 'image/jpeg', quality: 0.88 });
-      file = Array.isArray(converted) ? converted[0] : converted;
-    } catch(e) {
-      alert('HEIC画像の変換に失敗しました。\n写真をJPEGまたはPNGに変換してからお試しください。');
-      return;
-    }
-  }
   // MIME型が空でも拡張子で判断（iOS等でtype未設定になる場合がある）
-  const ext = file.name.split('.').pop().toLowerCase();
+  const ext = (file.name || '').split('.').pop().toLowerCase();
   const knownImg = /^(jpe?g|png|webp|gif|bmp|avif|heic|heif)$/.test(ext);
   if (!file.type.startsWith('image/') && !knownImg) return;
-  // Object URL を使用（大容量でも確実に表示できる）
+
+  const isHeic = file.type === 'image/heic' || file.type === 'image/heif'
+    || /\.(heic|heif)$/i.test(file.name);
+
+  let objUrl = URL.createObjectURL(file);
+
+  if (isHeic) {
+    // 1) まずブラウザのネイティブ HEIC 対応を試みる（Safari では不要な変換をしない）
+    const canLoadNative = await new Promise(resolve => {
+      const t = new Image();
+      const timer = setTimeout(() => { t.src = ''; resolve(false); }, 4000);
+      t.onload  = () => { clearTimeout(timer); resolve(true); };
+      t.onerror = () => { clearTimeout(timer); resolve(false); };
+      t.src = objUrl;
+    });
+
+    if (!canLoadNative) {
+      // 2) ネイティブ非対応 → heic2any で JPEG 変換
+      URL.revokeObjectURL(objUrl);
+      try {
+        const converted = await heic2any({ blob: file, toType: 'image/jpeg', quality: 0.88 });
+        const blob = Array.isArray(converted) ? converted[0] : converted;
+        objUrl = URL.createObjectURL(blob);
+      } catch(e) {
+        alert('HEIC画像を読み込めませんでした。\nカメラロールから写真を選ぶか、JPEGに変換してからお試しください。');
+        return;
+      }
+    }
+  }
+
   if (imgSrc && imgSrc.startsWith('blob:')) URL.revokeObjectURL(imgSrc);
-  imgSrc = URL.createObjectURL(file);
+  imgSrc = objUrl;
   runAnalysis();
 }
 
