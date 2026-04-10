@@ -243,17 +243,21 @@ async function loadFile(file) {
     || /\.(heic|heif)$/i.test(file.name);
   if (isHeic) {
     try {
-      const converted = await heic2any({ blob: file, toType: 'image/jpeg', quality: 0.92 });
+      const converted = await heic2any({ blob: file, toType: 'image/jpeg', quality: 0.88 });
       file = Array.isArray(converted) ? converted[0] : converted;
     } catch(e) {
       alert('HEIC画像の変換に失敗しました。\n写真をJPEGまたはPNGに変換してからお試しください。');
       return;
     }
   }
-  if (!file.type.startsWith('image/')) return;
-  const reader = new FileReader();
-  reader.onload = e => { imgSrc = e.target.result; runAnalysis(); };
-  reader.readAsDataURL(file);
+  // MIME型が空でも拡張子で判断（iOS等でtype未設定になる場合がある）
+  const ext = file.name.split('.').pop().toLowerCase();
+  const knownImg = /^(jpe?g|png|webp|gif|bmp|avif|heic|heif)$/.test(ext);
+  if (!file.type.startsWith('image/') && !knownImg) return;
+  // Object URL を使用（大容量でも確実に表示できる）
+  if (imgSrc && imgSrc.startsWith('blob:')) URL.revokeObjectURL(imgSrc);
+  imgSrc = URL.createObjectURL(file);
+  runAnalysis();
 }
 
 // ===================== ANALYSIS =====================
