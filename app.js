@@ -379,6 +379,7 @@ async function detectLandmarks(imgEl) {
 // ===================== IMAGE ANALYSIS =====================
 function lerp(a, b, t) { return { x: a.x+(b.x-a.x)*t, y: a.y+(b.y-a.y)*t }; }
 
+// グレースケール変換
 function getGrayData(canvas) {
   const {width:W, height:H} = canvas;
   const px = canvas.getContext('2d').getImageData(0,0,W,H).data;
@@ -387,30 +388,64 @@ function getGrayData(canvas) {
   return g;
 }
 
-// 指定エリアの中で「最も暗い行」のY座標を返す（シワ検出）
-function darkestRow(g, W, H, x0, x1, y0, y1) {
+// 局所コントラストマップ: 周囲の肌より「どれだけ暗いか」= シワらしさ
+// → 暗い背景は周囲も暗いのでスコア低。シワは周囲の肌より暗くスコア高。
+function getCreaseMap(canvas) {
+  const {width:W, height:H} = canvas;
+  const g = getGrayData(canvas);
+  // ブラー半径: 手のひら全体の約2%（シワ幅の数倍）
+  const R = Math.max(8, Math.round(Math.min(W,H)*0.025));
+  // セパラブル ボックスブラーで局所平均を計算（O(WH)）
+  const tmp = new Float32Array(W*H);
+  const blr = new Float32Array(W*H);
+  // 水平方向
+  for (let y=0;y<H;y++){
+    let s=0, lo=0, hi=0;
+    for (let x=0;x<W;x++){
+      while(hi<=Math.min(x+R,W-1)){ s+=g[y*W+hi]; hi++; }
+      while(lo<Math.max(0,x-R)){ s-=g[y*W+lo]; lo++; }
+      tmp[y*W+x]=s/(hi-lo);
+    }
+  }
+  // 垂直方向
+  for (let x=0;x<W;x++){
+    let s=0, lo=0, hi=0;
+    for (let y=0;y<H;y++){
+      while(hi<=Math.min(y+R,H-1)){ s+=tmp[hi*W+x]; hi++; }
+      while(lo<Math.max(0,y-R)){ s-=tmp[lo*W+x]; lo++; }
+      blr[y*W+x]=s/(hi-lo);
+    }
+  }
+  // シワマップ: 局所平均 − 自身の輝度（暗い＝正の値）
+  const c = new Float32Array(W*H);
+  for (let i=0;i<W*H;i++) c[i]=Math.max(0, blr[i]-g[i]);
+  return c;
+}
+
+// 指定エリアで「シワらしさが最も高い行」のY座標
+function creasiestRow(c, W, H, x0, x1, y0, y1) {
   x0=Math.max(0,~~x0); x1=Math.min(W,~~x1);
   y0=Math.max(0,~~y0); y1=Math.min(H,~~y1);
   if (y0>=y1||x0>=x1) return ~~((y0+y1)/2);
-  let bestY=~~((y0+y1)/2), best=Infinity;
+  let bestY=~~((y0+y1)/2), best=-1;
   for (let py=y0;py<y1;py++){
     let s=0,n=0;
-    for (let px=x0;px<x1;px++){s+=g[py*W+px];n++;}
-    const v=s/n; if(v<best){best=v;bestY=py;}
+    for (let px=x0;px<x1;px++){s+=c[py*W+px];n++;}
+    const v=s/n; if(v>best){best=v;bestY=py;}
   }
   return bestY;
 }
 
-// 指定エリアの中で「最も暗い列」のX座標を返す（シワ検出）
-function darkestCol(g, W, H, x0, x1, y0, y1) {
+// 指定エリアで「シワらしさが最も高い列」のX座標
+function creasiestCol(c, W, H, x0, x1, y0, y1) {
   x0=Math.max(0,~~x0); x1=Math.min(W,~~x1);
   y0=Math.max(0,~~y0); y1=Math.min(H,~~y1);
   if (y0>=y1||x0>=x1) return ~~((x0+x1)/2);
-  let bestX=~~((x0+x1)/2), best=Infinity;
+  let bestX=~~((x0+x1)/2), best=-1;
   for (let px=x0;px<x1;px++){
     let s=0,n=0;
-    for (let py=y0;py<y1;py++){s+=g[py*W+px];n++;}
-    const v=s/n; if(v<best){best=v;bestX=px;}
+    for (let py=y0;py<y1;py++){s+=c[py*W+px];n++;}
+    const v=s/n; if(v>best){best=v;bestX=px;}
   }
   return bestX;
 }
@@ -419,17 +454,18 @@ function darkestCol(g, W, H, x0, x1, y0, y1) {
 function calcCreasePaths(lm, canvas) {
   const W=canvas.width, H=canvas.height;
   const p=lm.map(l=>({x:l.x*W, y:l.y*H}));
-  const g=getGrayData(canvas);
+  // 局所コントラストマップ（背景の影に惑わされずシワを検出）
+  const c=getCreaseMap(canvas);
   const lr=lerp;
 
   // ── 手全体のバウンディングボックス（全21点から厳密算出）──
-  const allX = p.map(pt=>pt.x), allY = p.map(pt=>pt.y);
-  const hMinX = Math.min(...allX), hMaxX = Math.max(...allX);
-  const hMinY = Math.min(...allY), hMaxY = Math.max(...allY);
+  const allX=p.map(pt=>pt.x), allY=p.map(pt=>pt.y);
+  const hMinX=Math.min(...allX), hMaxX=Math.max(...allX);
+  const hMinY=Math.min(...allY), hMaxY=Math.max(...allY);
 
   // 座標を手の範囲内にクランプ
-  const cx = v => Math.max(hMinX, Math.min(hMaxX, v));
-  const cy = v => Math.max(hMinY, Math.min(hMaxY, v));
+  const cx2 = v=>Math.max(hMinX, Math.min(hMaxX, v));
+  const cy2 = v=>Math.max(hMinY, Math.min(hMaxY, v));
 
   // 手の基本寸法
   const fingerBaseY = Math.min(p[5].y,p[9].y,p[13].y,p[17].y);
@@ -437,7 +473,6 @@ function calcCreasePaths(lm, canvas) {
   const palmH       = Math.abs(wristY - fingerBaseY);
   const centerX     = p[9].x;
 
-  // 左右判定（自撮りなど鏡像対応）
   const flip       = p[5].x > p[17].x;
   const thumbSideX = flip ? Math.max(p[1].x,p[2].x) : Math.min(p[1].x,p[2].x);
   const pinkySideX = p[17].x;
@@ -445,104 +480,94 @@ function calcCreasePaths(lm, canvas) {
   const xRight     = Math.max(thumbSideX, pinkySideX);
   const palmW      = xRight - xLeft;
 
-  // ── 画像スキャン（手の範囲内のみ・狭いバンドで微調整）──
-  // baseX/baseY から snapR 以内の最暗点を探す（必ず手の内側に限定）
-  function snapX(baseX, baseY, snapR) {
-    const x0 = Math.max(hMinX, baseX - snapR);
-    const x1 = Math.min(hMaxX, baseX + snapR);
-    const y0 = Math.max(hMinY, baseY - palmH*0.035);
-    const y1 = Math.min(hMaxY, baseY + palmH*0.035);
-    if (x0>=x1||y0>=y1) return cx(baseX);
-    return cx(darkestCol(g, W, H, x0, x1, y0, y1));
+  // ── シワスナップ: 解剖学的位置から searchR 以内でシワらしさ最大点を探す ──
+  // 局所コントラストマップを使うので背景に引っ張られない
+  function snapX(baseX, baseY, searchR) {
+    const x0=Math.max(hMinX, baseX-searchR), x1=Math.min(hMaxX, baseX+searchR);
+    const y0=Math.max(hMinY, baseY-palmH*0.05), y1=Math.min(hMaxY, baseY+palmH*0.05);
+    if (x0>=x1||y0>=y1) return cx2(baseX);
+    return cx2(creasiestCol(c, W, H, x0, x1, y0, y1));
   }
-  function snapY(baseX, baseY, snapR) {
-    const x0 = Math.max(hMinX, baseX - palmW*0.04);
-    const x1 = Math.min(hMaxX, baseX + palmW*0.04);
-    const y0 = Math.max(hMinY, baseY - snapR);
-    const y1 = Math.min(hMaxY, baseY + snapR);
-    if (x0>=x1||y0>=y1) return cy(baseY);
-    return cy(darkestRow(g, W, H, x0, x1, y0, y1));
+  function snapY(baseX, baseY, searchR) {
+    const x0=Math.max(hMinX, baseX-palmW*0.06), x1=Math.min(hMaxX, baseX+palmW*0.06);
+    const y0=Math.max(hMinY, baseY-searchR), y1=Math.min(hMaxY, baseY+searchR);
+    if (x0>=x1||y0>=y1) return cy2(baseY);
+    return cy2(creasiestRow(c, W, H, x0, x1, y0, y1));
   }
 
   // ─────────────────────────────────────────────
-  // 【生命線】 親指の付け根を囲むC字カーブ
-  // ベジェ曲線: 起点(人差し指と親指の間) → 制御点(親指縁から内側) → 終点(手首親指側)
+  // 【生命線】親指の付け根を囲むC字カーブ（二次ベジェ）
   // ─────────────────────────────────────────────
-  const lifeP0 = {x: cx(lr(p[2],p[5],0.52).x), y: cy(lr(p[2],p[5],0.52).y)};
-  const lifeP2 = {x: cx(lr(p[0],p[1],0.32).x), y: cy(lr(p[0],p[1],0.32).y)};
-  // 制御点: 親指縁より palmW*0.12 内側（手の外に出ない）
-  const lifeCtrlX = cx(thumbSideX + (flip?-1:1)*palmW*0.12);
-  const lifeCtrlY = cy((lifeP0.y + lifeP2.y) * 0.5);
+  const lifeP0 = {x:cx2(lr(p[2],p[5],0.52).x), y:cy2(lr(p[2],p[5],0.52).y)};
+  const lifeP2 = {x:cx2(lr(p[0],p[1],0.32).x), y:cy2(lr(p[0],p[1],0.32).y)};
+  const lifeCtrlX = cx2(thumbSideX + (flip?-1:1)*palmW*0.14);
+  const lifeCtrlY = cy2((lifeP0.y+lifeP2.y)*0.5);
   const lifeRaw = [];
-  for (let i=0;i<7;i++){
-    const t=i/6, mt=1-t;
-    // 二次ベジェ
-    const bx = mt*mt*lifeP0.x + 2*mt*t*lifeCtrlX + t*t*lifeP2.x;
-    const by = mt*mt*lifeP0.y + 2*mt*t*lifeCtrlY + t*t*lifeP2.y;
-    // 狭いスキャン（±5%palmW）でシワに微調整。必ず手の内側。
-    const x = snapX(bx, by, palmW*0.05);
-    lifeRaw.push({x, y: cy(by)});
+  for (let i=0;i<10;i++){
+    const t=i/9, mt=1-t;
+    const bx=mt*mt*lifeP0.x + 2*mt*t*lifeCtrlX + t*t*lifeP2.x;
+    const by=mt*mt*lifeP0.y + 2*mt*t*lifeCtrlY + t*t*lifeP2.y;
+    const x=snapX(bx, by, palmW*0.10);  // 検索幅を広げ実際のシワを拾う
+    lifeRaw.push({x, y:cy2(by)});
   }
 
   // ─────────────────────────────────────────────
-  // 【感情線】 小指側〜人差し指付け根を横切る横線
-  // 指付け根から 14〜20% 下の横線
+  // 【感情線】小指側〜人差し指付け根の横線（指付け根下14〜22%）
   // ─────────────────────────────────────────────
   const heartBaseY = fingerBaseY + palmH*0.17;
   const heartRaw = [];
-  for (let i=0;i<=6;i++){
-    const xC = cx(xLeft + palmW*(i/6));
-    const y  = snapY(xC, heartBaseY, palmH*0.07);
+  for (let i=0;i<=9;i++){
+    const xC=cx2(xLeft+palmW*(i/9));
+    const y=snapY(xC, heartBaseY, palmH*0.10);
     heartRaw.push({x:xC, y});
   }
 
   // ─────────────────────────────────────────────
-  // 【知能線】 生命線起点付近〜小指方向、感情線より下
-  // 指付け根から 30〜40% 下、やや斜め下
+  // 【知能線】生命線起点付近〜小指方向（感情線から15〜25%下）
   // ─────────────────────────────────────────────
-  const headBaseY = fingerBaseY + palmH*0.35;
+  const headBaseY = fingerBaseY + palmH*0.34;
   const headRaw = [];
-  for (let i=0;i<=5;i++){
-    const t  = i/5;
-    const xC = cx(lifeP0.x + (xRight - lifeP0.x)*t);
-    const y  = snapY(xC, headBaseY + palmH*0.05*t, palmH*0.08);
+  for (let i=0;i<=8;i++){
+    const t=i/8;
+    const xC=cx2(lifeP0.x + (xRight-lifeP0.x)*t);
+    const y=snapY(xC, headBaseY+palmH*0.06*t, palmH*0.11);
     headRaw.push({x:xC, y});
   }
 
   // ─────────────────────────────────────────────
-  // 【運命線】 手首中央〜中指付け根への縦線
+  // 【運命線】手首中央〜中指付け根の縦線
   // ─────────────────────────────────────────────
   const fateRaw = [];
-  for (let i=0;i<5;i++){
-    const t  = i/4;
-    const sy = cy(wristY + (fingerBaseY - wristY)*t);
-    const x  = snapX(centerX, sy, palmW*0.07);
+  for (let i=0;i<8;i++){
+    const t=i/7;
+    const sy=cy2(wristY+(fingerBaseY-wristY)*t);
+    const x=snapX(centerX, sy, palmW*0.12);
     fateRaw.push({x, y:sy});
   }
 
   // ─────────────────────────────────────────────
-  // 【太陽線】薬指(p[13])下の短い縦線
+  // 【太陽線】薬指(p[13])下の縦線
   // ─────────────────────────────────────────────
   const sunPts = [
-    {x:cx(p[13].x), y:cy(fingerBaseY+palmH*0.12)},
-    {x:cx(p[13].x), y:cy(fingerBaseY+palmH*0.52)}
+    {x:cx2(p[13].x), y:cy2(fingerBaseY+palmH*0.12)},
+    {x:cx2(p[13].x), y:cy2(fingerBaseY+palmH*0.52)}
   ];
 
   // ─────────────────────────────────────────────
-  // 【結婚線】小指付け根の外側、短い横線
+  // 【結婚線】小指付け根の外側の短い横線
   // ─────────────────────────────────────────────
-  const marY  = cy(fingerBaseY + palmH*0.10);
-  const marX0 = cx(p[17].x + (flip?1:-1)*palmW*0.06);
-  const marX1 = cx(p[17].x - (flip?1:-1)*palmW*0.18);
-  const marPts = [{x:marX0, y:marY}, {x:marX1, y:marY}];
+  const marY  = cy2(fingerBaseY+palmH*0.10);
+  const marX0 = cx2(p[17].x+(flip?1:-1)*palmW*0.06);
+  const marX1 = cx2(p[17].x-(flip?1:-1)*palmW*0.18);
+  const marPts = [{x:marX0, y:marY},{x:marX1, y:marY}];
 
   // ─────────────────────────────────────────────
-  // 【その他の線】骨格基準で固定（スキャンなし）
+  // 【その他の線】骨格基準で固定
   // ─────────────────────────────────────────────
-  const monX = cx(lr(p[9],p[13],0.5).x);
-  const popX = cx(lr(p[13],p[17],0.38).x);
-  const chX  = cx(lr(p[5],p[9],0.3).x);
-  const devX = cx(lr(p[1],p[5],0.3).x);
+  const monX=cx2(lr(p[9],p[13],0.5).x);
+  const popX=cx2(lr(p[13],p[17],0.38).x);
+  const chX =cx2(lr(p[5],p[9],0.3).x);
+  const devX=cx2(lr(p[1],p[5],0.3).x);
 
   return {
     life:     lifeRaw,
@@ -551,10 +576,10 @@ function calcCreasePaths(lm, canvas) {
     fate:     fateRaw,
     sun:      sunPts,
     marriage: marPts,
-    money:    [{x:monX, y:cy(fingerBaseY+palmH*0.28)}, {x:monX, y:cy(fingerBaseY+palmH*0.62)}],
-    popular:  [{x:popX, y:cy(fingerBaseY+palmH*0.14)}, {x:popX, y:cy(fingerBaseY+palmH*0.42)}],
-    charm:    [{x:chX,  y:cy(fingerBaseY+palmH*0.28)}, {x:cx(chX-(flip?-1:1)*palmH*0.04), y:cy(fingerBaseY+palmH*0.50)}],
-    devotion: [{x:devX, y:cy(fingerBaseY+palmH*0.40)}, {x:cx(devX+(flip?-1:1)*palmH*0.05), y:cy(fingerBaseY+palmH*0.60)}],
+    money:    [{x:monX,y:cy2(fingerBaseY+palmH*0.28)},{x:monX,y:cy2(fingerBaseY+palmH*0.62)}],
+    popular:  [{x:popX,y:cy2(fingerBaseY+palmH*0.14)},{x:popX,y:cy2(fingerBaseY+palmH*0.42)}],
+    charm:    [{x:chX, y:cy2(fingerBaseY+palmH*0.28)},{x:cx2(chX-(flip?-1:1)*palmH*0.04),y:cy2(fingerBaseY+palmH*0.50)}],
+    devotion: [{x:devX,y:cy2(fingerBaseY+palmH*0.40)},{x:cx2(devX+(flip?-1:1)*palmH*0.05),y:cy2(fingerBaseY+palmH*0.60)}],
   };
 }
 
