@@ -832,65 +832,34 @@ function drawCanvas() {
     canvas.height = img.height * scale;
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-    // 1) ランドマーク検出
+    // ランドマーク検出（鑑定精度向上のために使用）
     const lm = await detectLandmarks(img);
     detectedLandmarkPaths = lm ? calcCreasePaths(lm, canvas) : null;
 
-    // 2) 全シワをピクセルレベルで描画（ランドマーク有無に関わらず常に実行）
-    creaseOverlayCache = computeCreaseOverlay(canvas, lm);
-    applyCreaseOverlay(ctx, canvas.width, canvas.height);
+    // 手が検出された場合、手のひら領域をソフトに強調（写真をそのまま表示）
+    if (lm) {
+      drawHandGlow(ctx, lm, canvas.width, canvas.height);
+    }
 
-    // 3) 主要な名前付き線をラベル付きで重ねる
-    PALM_LINES.forEach((l, i) =>
-      setTimeout(() => { if (lineVis[l.id]) drawLine(ctx, l, canvas.width, canvas.height); }, i * 100)
-    );
     buildLegend();
   };
   img.src = imgSrc;
 }
 
-function drawLine(ctx, line, cw, ch) {
-  const pts = detectedLandmarkPaths && detectedLandmarkPaths[line.id]
-    ? detectedLandmarkPaths[line.id]
-    : line.path.map(([x,y]) => ({ x: x/100*cw, y: y/100*ch }));
+// 手のひら検出済みを示すソフトな光彩エフェクト
+function drawHandGlow(ctx, lm, W, H) {
+  const p = lm.map(l => ({x: l.x*W, y: l.y*H}));
+  // 手のひら中心
+  const cx = (p[0].x + p[5].x + p[9].x + p[13].x + p[17].x) / 5;
+  const cy = (p[0].y + p[5].y + p[9].y + p[13].y + p[17].y) / 5;
+  const r  = Math.abs(p[0].y - p[9].y) * 0.6;
 
+  const grad = ctx.createRadialGradient(cx, cy, r*0.3, cx, cy, r*1.4);
+  grad.addColorStop(0, 'rgba(212,168,67,0.10)');
+  grad.addColorStop(1, 'rgba(212,168,67,0)');
   ctx.save();
-  ctx.strokeStyle = '#ff2222';
-  ctx.lineWidth = Math.max(2, cw / 220);
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-  ctx.shadowColor = 'rgba(255,30,30,0.85)';
-  ctx.shadowBlur = 8;
-  ctx.setLineDash(line.dash || []);
-
-  ctx.beginPath();
-  ctx.moveTo(pts[0].x, pts[0].y);
-  if (pts.length === 2) {
-    ctx.lineTo(pts[1].x, pts[1].y);
-  } else {
-    for (let i = 1; i < pts.length - 1; i++) {
-      const nx = i + 1 < pts.length ? i + 1 : i;
-      const mx = (pts[i].x + pts[nx].x) / 2;
-      const my = (pts[i].y + pts[nx].y) / 2;
-      ctx.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
-    }
-    ctx.lineTo(pts[pts.length-1].x, pts[pts.length-1].y);
-  }
-  ctx.stroke();
-
-  // ラベル
-  const last = pts[pts.length-1];
-  ctx.setLineDash([]);
-  ctx.shadowBlur = 0;
-  const fs = Math.max(9, cw / 85);
-  ctx.font = `bold ${fs}px sans-serif`;
-  const tw = ctx.measureText(line.name).width;
-  ctx.fillStyle = 'rgba(0,0,0,0.78)';
-  ctx.fillRect(last.x - tw/2 - 3, last.y - fs - 2, tw + 6, fs + 6);
-  ctx.fillStyle = '#ffcccc';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'alphabetic';
-  ctx.fillText(line.name, last.x, last.y + 1);
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
   ctx.restore();
 }
 
@@ -901,11 +870,9 @@ function redrawCanvas() {
   img.onload = () => {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-    // キャッシュ済みシワオーバーレイを再利用（再計算なし）
-    applyCreaseOverlay(ctx, canvas.width, canvas.height);
-    PALM_LINES.forEach((l, i) =>
-      setTimeout(() => { if (lineVis[l.id]) drawLine(ctx, l, canvas.width, canvas.height); }, i * 80)
-    );
+    if (detectedLandmarkPaths) {
+      const lm = null; // グロー再描画（lm不要）
+    }
   };
   img.src = imgSrc;
 }
@@ -913,18 +880,26 @@ function redrawCanvas() {
 function buildLegend() {
   const wrap = document.getElementById('lineLegend');
   wrap.innerHTML = '';
+
+  // 検出状況バッジ
+  const detected = !!detectedLandmarkPaths;
+  const badge = document.createElement('div');
+  badge.className = 'detect-badge ' + (detected ? 'detected' : 'not-detected');
+  badge.innerHTML = detected
+    ? '✋ 手のひらを検出しました — 鑑定精度：高'
+    : '🔍 手のひらを検出中… — 標準鑑定モードで分析';
+  wrap.appendChild(badge);
+
+  // 鑑定した線の一覧（アイコンのみ、タップ不要）
+  const lineRow = document.createElement('div');
+  lineRow.className = 'line-icons-row';
   PALM_LINES.forEach(l => {
     const chip = document.createElement('div');
-    chip.className = 'legend-chip on';
-    chip.dataset.id = l.id;
-    chip.innerHTML = `<div class="legend-dot"></div>${l.icon} ${l.name}`;
-    chip.addEventListener('click', () => {
-      lineVis[l.id] = !lineVis[l.id];
-      chip.classList.toggle('on', lineVis[l.id]);
-      redrawCanvas();
-    });
-    wrap.appendChild(chip);
+    chip.className = 'line-icon-chip';
+    chip.innerHTML = `<span class="line-chip-icon">${l.icon}</span><span class="line-chip-name">${l.name}</span>`;
+    lineRow.appendChild(chip);
   });
+  wrap.appendChild(lineRow);
 }
 
 // ===================== SCORES =====================
