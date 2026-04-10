@@ -367,149 +367,160 @@ function getGrayData(canvas) {
   const {width:W, height:H} = canvas;
   const px = canvas.getContext('2d').getImageData(0,0,W,H).data;
   const g = new Float32Array(W*H);
-  for (let i=0; i<g.length; i++) g[i] = 0.299*px[i*4] + 0.587*px[i*4+1] + 0.114*px[i*4+2];
+  for (let i=0;i<g.length;i++) g[i]=0.299*px[i*4]+0.587*px[i*4+1]+0.114*px[i*4+2];
   return g;
 }
 
-// Find y-row with lowest mean brightness in a region (= crease location)
+// 指定エリアの中で「最も暗い行」のY座標を返す（シワ検出）
 function darkestRow(g, W, H, x0, x1, y0, y1) {
   x0=Math.max(0,~~x0); x1=Math.min(W,~~x1);
   y0=Math.max(0,~~y0); y1=Math.min(H,~~y1);
   if (y0>=y1||x0>=x1) return ~~((y0+y1)/2);
   let bestY=~~((y0+y1)/2), best=Infinity;
-  for (let py=y0; py<y1; py++) {
-    let s=0, n=0;
-    for (let px=x0; px<x1; px++) { s+=g[py*W+px]; n++; }
-    const v=s/n;
-    if (v<best) { best=v; bestY=py; }
+  for (let py=y0;py<y1;py++){
+    let s=0,n=0;
+    for (let px=x0;px<x1;px++){s+=g[py*W+px];n++;}
+    const v=s/n; if(v<best){best=v;bestY=py;}
   }
   return bestY;
 }
 
-// Find x-column with lowest mean brightness (= crease location)
+// 指定エリアの中で「最も暗い列」のX座標を返す（シワ検出）
 function darkestCol(g, W, H, x0, x1, y0, y1) {
   x0=Math.max(0,~~x0); x1=Math.min(W,~~x1);
   y0=Math.max(0,~~y0); y1=Math.min(H,~~y1);
   if (y0>=y1||x0>=x1) return ~~((x0+x1)/2);
   let bestX=~~((x0+x1)/2), best=Infinity;
-  for (let px=x0; px<x1; px++) {
-    let s=0, n=0;
-    for (let py=y0; py<y1; py++) { s+=g[py*W+px]; n++; }
-    const v=s/n;
-    if (v<best) { best=v; bestX=px; }
+  for (let px=x0;px<x1;px++){
+    let s=0,n=0;
+    for (let py=y0;py<y1;py++){s+=g[py*W+px];n++;}
+    const v=s/n; if(v<best){best=v;bestX=px;}
   }
   return bestX;
 }
 
-// ===================== CREASE PATH DETECTION =====================
+// ===================== 手相線パス計算 =====================
 function calcCreasePaths(lm, canvas) {
   const W=canvas.width, H=canvas.height;
   const p=lm.map(l=>({x:l.x*W, y:l.y*H}));
   const g=getGrayData(canvas);
   const lr=lerp;
 
-  const palmH = Math.abs(p[0].y - p[9].y);
-  const palmW_half = palmH * 0.45;
+  // 手の基本寸法
+  const palmH      = Math.abs(p[0].y - p[9].y);       // 手首〜中指付け根の高さ
+  const fingerBaseY = Math.min(p[5].y,p[9].y,p[13].y,p[17].y); // 指付け根ライン
+  const wristY     = p[0].y;                           // 手首
+  const centerX    = p[9].x;                           // 中指の中心X
 
-  // Palm geometry
-  const fingerBaseY = Math.min(p[5].y, p[9].y, p[13].y, p[17].y);
-  const wristY = p[0].y;
-  const centerX = p[9].x;
+  // 左右判定（自撮りなど鏡像対応）
+  const flip       = p[5].x > p[17].x;
+  const thumbSideX = flip ? Math.max(p[1].x,p[2].x) : Math.min(p[1].x,p[2].x);
+  const pinkySideX = p[17].x;
+  const xLeft      = Math.min(thumbSideX, pinkySideX);
+  const xRight     = Math.max(thumbSideX, pinkySideX);
+  const palmW      = xRight - xLeft;
 
-  // Is this a right or left hand? (index finger side)
-  const flip = p[5].x > p[17].x;
-  const thumbX = flip ? Math.max(p[1].x,p[2].x) : Math.min(p[1].x,p[2].x);
-  const pinkyX = flip ? Math.min(p[17].x) : Math.max(p[17].x);
-  const xLeft  = Math.min(thumbX, pinkyX) - palmH*0.02;
-  const xRight = Math.max(thumbX, pinkyX) + palmH*0.02;
-  const palmW  = xRight - xLeft;
+  // ─────────────────────────────────────────────
+  // 【生命線】 親指の付け根を囲むC字カーブ
+  // 解剖学的位置：人差し指付け根〜親指付け根間から始まり、
+  // 親指の丘（金星丘）を弧を描いて手首へ向かう
+  // ─────────────────────────────────────────────
+  const lifeStart = lr(p[2], p[5], 0.42);  // 起点：人差し指と親指の間
+  const lifeEnd   = lr(p[0], p[1], 0.2);   // 終点：手首の親指側
 
-  // ── 感情線 Heart ── scan rows in top 22% of palm, multi-section
-  const heartPts = [];
-  const hSeg = 5;
-  for (let i=0; i<=hSeg; i++) {
-    const xC = xLeft + palmW*(i/hSeg);
-    const hw  = palmW/hSeg * 0.9;
-    const y = darkestRow(g, W, H, xC-hw, xC+hw, fingerBaseY, fingerBaseY+palmH*0.22);
-    heartPts.push({x:xC, y});
+  // 親指の丘を回り込むための制御点（弧の外側）
+  const thumbMount = { x: thumbSideX - (flip?-1:1)*palmH*0.12, y: lr(lifeStart,lifeEnd,0.5).y };
+
+  // 画像スキャンで実際のシワY位置を微調整（各高さで最暗列を検出）
+  const lifeRaw = [];
+  for (let i=0;i<6;i++){
+    const t=i/5;
+    const sy = lifeStart.y + (lifeEnd.y - lifeStart.y)*t;
+    const baseX = lifeStart.x + (thumbMount.x - lifeStart.x)*Math.sin(t*Math.PI);
+    const rx = palmW*0.2;
+    const x = darkestCol(g, W, H, baseX-rx, baseX+rx, sy-palmH*0.06, sy+palmH*0.06);
+    lifeRaw.push({x, y:sy});
   }
 
-  // ── 知能線 Head ── scan rows 22–46% of palm
-  const headPts = [];
-  const dSeg = 4;
-  for (let i=0; i<=dSeg; i++) {
-    const xC = xLeft + palmW*(i/dSeg);
-    const hw  = palmW/dSeg * 0.9;
-    const y = darkestRow(g, W, H, xC-hw, xC+hw, fingerBaseY+palmH*0.21, fingerBaseY+palmH*0.46);
-    headPts.push({x:xC, y});
+  // ─────────────────────────────────────────────
+  // 【感情線】 小指側〜人差し指付け根を横切る弧
+  // 手のひら上部、指付け根から15〜20%下の横線
+  // ─────────────────────────────────────────────
+  const heartRaw = [];
+  const hSeg = 6;
+  for (let i=0;i<=hSeg;i++){
+    const t = i/hSeg;
+    const xC = xLeft + palmW*t;
+    const hw  = palmW/hSeg * 0.85;
+    // 感情線の探索エリア：指付け根〜そこから22%下
+    const y = darkestRow(g, W, H, xC-hw, xC+hw, fingerBaseY, fingerBaseY+palmH*0.23);
+    heartRaw.push({x:xC, y});
   }
 
-  // ── 生命線 Life ── scan columns near thumb side, from top to wrist
-  const lifeOriginY = lr(p[2],p[5],0.4).y;
-  const lifePts = [];
-  for (let i=0; i<5; i++) {
-    const t = i/4;
-    const scanY = lifeOriginY + (wristY - lifeOriginY)*t;
-    const xCtr  = thumbX + (centerX - thumbX)*0.25;
-    const xRange = palmW * 0.26;
-    const x = darkestCol(g, W, H, xCtr-xRange, xCtr+xRange, scanY-palmH*0.06, scanY+palmH*0.06);
-    lifePts.push({x, y:scanY});
+  // ─────────────────────────────────────────────
+  // 【知能線】 生命線の起点付近〜小指方向の横線
+  // 感情線より下（22〜46%）で、やや斜め下に伸びる
+  // ─────────────────────────────────────────────
+  const headOriginX = lifeStart.x + (xRight - lifeStart.x)*0.05;
+  const headRaw = [];
+  const dSeg = 5;
+  for (let i=0;i<=dSeg;i++){
+    const t = i/dSeg;
+    const xC = headOriginX + (xRight - headOriginX)*t;
+    const hw  = (xRight - headOriginX)/dSeg * 0.85;
+    const y = darkestRow(g, W, H, xC-hw, xC+hw, fingerBaseY+palmH*0.22, fingerBaseY+palmH*0.48);
+    headRaw.push({x:xC, y});
   }
 
-  // ── 運命線 Fate ── scan columns in center, from wrist to finger base
-  const fatePts = [];
-  for (let i=0; i<4; i++) {
-    const t = i/3;
-    const scanY = wristY + (fingerBaseY - wristY)*t;
-    const xRange = palmW * 0.16;
-    const x = darkestCol(g, W, H, centerX-xRange, centerX+xRange, scanY-palmH*0.08, scanY+palmH*0.08);
-    fatePts.push({x, y:scanY});
+  // ─────────────────────────────────────────────
+  // 【運命線】 手首中央〜中指付け根への縦線
+  // ─────────────────────────────────────────────
+  const fateRaw = [];
+  for (let i=0;i<5;i++){
+    const t=i/4;
+    const sy = wristY + (fingerBaseY - wristY)*t;
+    const rx = palmW*0.15;
+    const x = darkestCol(g, W, H, centerX-rx, centerX+rx, sy-palmH*0.07, sy+palmH*0.07);
+    fateRaw.push({x, y:sy});
   }
 
-  // ── 太陽線 Sun ── near ring finger, short vertical
+  // ─────────────────────────────────────────────
+  // 【太陽線】薬指下の短い縦線
+  // ─────────────────────────────────────────────
   const sunPts = [
-    {x:p[13].x, y:p[13].y+palmH*0.1},
-    {x:p[13].x, y:p[13].y+palmH*0.52}
+    {x:p[13].x, y:fingerBaseY+palmH*0.12},
+    {x:p[13].x, y:fingerBaseY+palmH*0.55}
   ];
 
-  // ── 結婚線 Marriage ── small horizontal, pinky edge
+  // ─────────────────────────────────────────────
+  // 【結婚線】小指の外側付近の短い横線
+  // ─────────────────────────────────────────────
   const marY   = lr(p[17],p[5],0.13).y;
-  const marOff = palmW*0.2;
+  const marOff = palmW*0.22;
   const marPts = [
     {x: flip ? p[17].x+marOff : p[17].x-marOff, y:marY},
-    {x: flip ? p[17].x+marOff*0.35 : p[17].x-marOff*0.35, y:marY}
+    {x: flip ? p[17].x+marOff*0.3 : p[17].x-marOff*0.3, y:marY}
   ];
 
-  // ── 金運線 Money ── between fate and sun
-  const monX = lr(p[9],p[13],0.48).x;
-  const monPts = [
-    {x:monX, y:fingerBaseY+palmH*0.3},
-    {x:monX, y:fingerBaseY+palmH*0.68}
-  ];
+  // ─────────────────────────────────────────────
+  // 【その他の線】位置は骨格ベースで固定
+  // ─────────────────────────────────────────────
+  const monX = lr(p[9],p[13],0.5).x;
+  const popX = lr(p[13],p[17],0.38).x;
+  const chX  = lr(p[5],p[9],0.28).x;
 
-  // ── 人気線 Popular ── ring-pinky side
-  const popX = lr(p[13],p[17],0.4).x;
-  const popPts = [
-    {x:popX, y:fingerBaseY+palmH*0.13},
-    {x:popX, y:fingerBaseY+palmH*0.4}
-  ];
-
-  // ── モテ線 Charm ── index-middle side
-  const chX = lr(p[5],p[9],0.28).x;
-  const charmPts = [
-    {x:chX, y:fingerBaseY+palmH*0.27},
-    {x:chX-(flip?-1:1)*palmH*0.03, y:fingerBaseY+palmH*0.5}
-  ];
-
-  // ── つくし線 Devotion ── near life line upper
-  const devPts = [
-    {x:lr(p[1],p[5],0.22).x, y:fingerBaseY+palmH*0.43},
-    {x:lr(p[1],p[5],0.4).x,  y:fingerBaseY+palmH*0.6}
-  ];
-
-  return { life:lifePts, heart:heartPts, head:headPts, fate:fatePts,
-           sun:sunPts, marriage:marPts, money:monPts, popular:popPts,
-           charm:charmPts, devotion:devPts };
+  return {
+    life:     lifeRaw,
+    heart:    heartRaw,
+    head:     headRaw,
+    fate:     fateRaw,
+    sun:      sunPts,
+    marriage: marPts,
+    money:    [{x:monX, y:fingerBaseY+palmH*0.3}, {x:monX, y:fingerBaseY+palmH*0.68}],
+    popular:  [{x:popX, y:fingerBaseY+palmH*0.15}, {x:popX, y:fingerBaseY+palmH*0.42}],
+    charm:    [{x:chX,  y:fingerBaseY+palmH*0.3},  {x:chX-(flip?-1:1)*palmH*0.03, y:fingerBaseY+palmH*0.52}],
+    devotion: [{x:lr(p[1],p[5],0.22).x, y:fingerBaseY+palmH*0.45}, {x:lr(p[1],p[5],0.4).x, y:fingerBaseY+palmH*0.62}],
+  };
 }
 
 // ===================== CANVAS =====================
