@@ -699,57 +699,83 @@ function calcCreasePaths(lm, canvas) {
 let creaseOverlayCache = null;
 
 // 手のひら全体の細かいシワをピクセルレベルで ImageData に変換
+// lm がなくても動作する（画像全体をスキャン）
 function computeCreaseOverlay(canvas, lm) {
   const W = canvas.width, H = canvas.height;
   const g = getGrayData(canvas);
 
-  // 細かいシワ用に小さいブラー半径（主要線検出より細かく）
-  const R = Math.max(4, Math.round(Math.min(W, H) * 0.012));
-  const tmp = new Float32Array(W * H);
-  const blr = new Float32Array(W * H);
+  // 2段階ブラー: 細かいシワ(R1) + 粗いシワ(R2) を合成
+  const R1 = Math.max(3, Math.round(Math.min(W, H) * 0.010));
+  const R2 = Math.max(8, Math.round(Math.min(W, H) * 0.025));
 
-  // セパラブル ボックスブラー（水平）
-  for (let y = 0; y < H; y++) {
-    let s = 0, lo = 0, hi = 0;
-    for (let x = 0; x < W; x++) {
-      while (hi <= Math.min(x + R, W - 1)) { s += g[y * W + hi]; hi++; }
-      while (lo < Math.max(0, x - R))      { s -= g[y * W + lo]; lo++; }
-      tmp[y * W + x] = s / (hi - lo);
-    }
-  }
-  // セパラブル ボックスブラー（垂直）
-  for (let x = 0; x < W; x++) {
-    let s = 0, lo = 0, hi = 0;
+  function boxBlur(src, r) {
+    const tmp2 = new Float32Array(W * H);
+    const out  = new Float32Array(W * H);
     for (let y = 0; y < H; y++) {
-      while (hi <= Math.min(y + R, H - 1)) { s += tmp[hi * W + x]; hi++; }
-      while (lo < Math.max(0, y - R))      { s -= tmp[lo * W + x]; lo++; }
-      blr[y * W + x] = s / (hi - lo);
+      let s = 0, lo = 0, hi = 0;
+      for (let x = 0; x < W; x++) {
+        while (hi <= Math.min(x + r, W - 1)) { s += src[y * W + hi]; hi++; }
+        while (lo < Math.max(0, x - r))      { s -= src[y * W + lo]; lo++; }
+        tmp2[y * W + x] = s / (hi - lo);
+      }
     }
+    for (let x = 0; x < W; x++) {
+      let s = 0, lo = 0, hi = 0;
+      for (let y = 0; y < H; y++) {
+        while (hi <= Math.min(y + r, H - 1)) { s += tmp2[hi * W + x]; hi++; }
+        while (lo < Math.max(0, y - r))      { s -= tmp2[lo * W + x]; lo++; }
+        out[y * W + x] = s / (hi - lo);
+      }
+    }
+    return out;
   }
 
-  // 手のバウンディングボックス（手の外のノイズを除去）
-  const p = lm.map(l => ({x: l.x * W, y: l.y * H}));
-  const allX = p.map(pt => pt.x), allY = p.map(pt => pt.y);
-  const hMinX = Math.max(0,  Math.min(...allX) - 12);
-  const hMaxX = Math.min(W,  Math.max(...allX) + 12);
-  const hMinY = Math.max(0,  Math.min(...allY) - 12);
-  const hMaxY = Math.min(H,  Math.max(...allY) + 12);
+  const R3 = Math.max(14, Math.round(Math.min(W, H) * 0.045));
+  const blr1 = boxBlur(g, R1);
+  const blr2 = boxBlur(g, R2);
+  const blr3 = boxBlur(g, R3);
 
-  // シワらしさ = 局所平均 − 自身の輝度
+  // 手のバウンディングボックス（ランドマークあれば手の範囲に限定、なければ全体）
+  let hMinX = 0, hMaxX = W, hMinY = 0, hMaxY = H;
+  if (lm) {
+    const p = lm.map(l => ({x: l.x * W, y: l.y * H}));
+    const allX = p.map(pt => pt.x), allY = p.map(pt => pt.y);
+    hMinX = Math.max(0, Math.min(...allX) - 20);
+    hMaxX = Math.min(W, Math.max(...allX) + 20);
+    hMinY = Math.max(0, Math.min(...allY) - 20);
+    hMaxY = Math.min(H, Math.max(...allY) + 20);
+  }
+
+  // シワスコアマップ: 3段階スケール最大値
+  const score = new Float32Array(W * H);
+  for (let i = 0; i < W * H; i++) {
+    const s1 = blr1[i] - g[i];
+    const s2 = blr2[i] - g[i];
+    const s3 = blr3[i] - g[i];
+    score[i] = Math.max(s1, s2, s3);
+  }
+
+  // 非最大値抑制（NMS）: 8近傍で局所最大のピクセルのみ残す → シワが細く鮮明になる
+  const thr = 3.5, range = 18;
   const id = new ImageData(W, H);
-  const thr = 7, range = 28;
 
-  for (let y = ~~hMinY; y < ~~hMaxY; y++) {
-    for (let x = ~~hMinX; x < ~~hMaxX; x++) {
-      const score = blr[y * W + x] - g[y * W + x];
-      if (score > thr) {
-        const a = Math.min(240, Math.round((score - thr) / range * 240));
-        const i = (y * W + x) * 4;
-        id.data[i]   = 255;  // R
-        id.data[i+1] = 30;   // G
-        id.data[i+2] = 30;   // B
-        id.data[i+3] = a;
-      }
+  for (let y = ~~hMinY + 1; y < ~~hMaxY - 1; y++) {
+    for (let x = ~~hMinX + 1; x < ~~hMaxX - 1; x++) {
+      const sc = score[y * W + x];
+      if (sc <= thr) continue;
+      // 8近傍の最大値より大きければ局所最大
+      const neighbors = [
+        score[(y-1)*W+(x-1)], score[(y-1)*W+x], score[(y-1)*W+(x+1)],
+        score[y*W+(x-1)],                         score[y*W+(x+1)],
+        score[(y+1)*W+(x-1)], score[(y+1)*W+x], score[(y+1)*W+(x+1)],
+      ];
+      if (sc < Math.max(...neighbors)) continue; // 局所最大でなければスキップ
+      const a = Math.min(255, Math.round((sc - thr) / range * 255));
+      const idx = (y * W + x) * 4;
+      id.data[idx]   = 255;
+      id.data[idx+1] = 15;
+      id.data[idx+2] = 15;
+      id.data[idx+3] = Math.max(180, a); // 最低でも70%の不透明度で鮮明に
     }
   }
   return id;
@@ -783,11 +809,9 @@ function drawCanvas() {
     const lm = await detectLandmarks(img);
     detectedLandmarkPaths = lm ? calcCreasePaths(lm, canvas) : null;
 
-    // 2) 全シワをピクセルレベルで描画（細かいシワも含む）
-    if (lm) {
-      creaseOverlayCache = computeCreaseOverlay(canvas, lm);
-      applyCreaseOverlay(ctx, canvas.width, canvas.height);
-    }
+    // 2) 全シワをピクセルレベルで描画（ランドマーク有無に関わらず常に実行）
+    creaseOverlayCache = computeCreaseOverlay(canvas, lm);
+    applyCreaseOverlay(ctx, canvas.width, canvas.height);
 
     // 3) 主要な名前付き線をラベル付きで重ねる
     PALM_LINES.forEach((l, i) =>
