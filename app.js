@@ -698,84 +698,111 @@ function calcCreasePaths(lm, canvas) {
 // ===================== CREASE OVERLAY =====================
 let creaseOverlayCache = null;
 
-// 手のひら全体の細かいシワをピクセルレベルで ImageData に変換
-// lm がなくても動作する（画像全体をスキャン）
+// Sobelエッジ検出 + 方向別NMSでシワを1ピクセル幅の鮮明な線として検出
 function computeCreaseOverlay(canvas, lm) {
   const W = canvas.width, H = canvas.height;
-  const g = getGrayData(canvas);
+  const raw = getGrayData(canvas);
 
-  // 2段階ブラー: 細かいシワ(R1) + 粗いシワ(R2) を合成
-  const R1 = Math.max(3, Math.round(Math.min(W, H) * 0.010));
-  const R2 = Math.max(8, Math.round(Math.min(W, H) * 0.025));
-
-  function boxBlur(src, r) {
-    const tmp2 = new Float32Array(W * H);
-    const out  = new Float32Array(W * H);
-    for (let y = 0; y < H; y++) {
-      let s = 0, lo = 0, hi = 0;
-      for (let x = 0; x < W; x++) {
-        while (hi <= Math.min(x + r, W - 1)) { s += src[y * W + hi]; hi++; }
-        while (lo < Math.max(0, x - r))      { s -= src[y * W + lo]; lo++; }
-        tmp2[y * W + x] = s / (hi - lo);
-      }
+  // 1) ガウシアンブラー（ノイズ除去、シワのエッジを保持）
+  // カーネル: 5x5 近似
+  const g = new Float32Array(W * H);
+  const gk = [1,4,6,4,1, 4,16,24,16,4, 6,24,36,24,6, 4,16,24,16,4, 1,4,6,4,1];
+  const gsum = 256;
+  for (let y = 2; y < H-2; y++) {
+    for (let x = 2; x < W-2; x++) {
+      let s = 0, ki = 0;
+      for (let dy = -2; dy <= 2; dy++)
+        for (let dx = -2; dx <= 2; dx++)
+          s += raw[(y+dy)*W+(x+dx)] * gk[ki++];
+      g[y*W+x] = s / gsum;
     }
-    for (let x = 0; x < W; x++) {
-      let s = 0, lo = 0, hi = 0;
-      for (let y = 0; y < H; y++) {
-        while (hi <= Math.min(y + r, H - 1)) { s += tmp2[hi * W + x]; hi++; }
-        while (lo < Math.max(0, y - r))      { s -= tmp2[lo * W + x]; lo++; }
-        out[y * W + x] = s / (hi - lo);
-      }
-    }
-    return out;
   }
 
-  const R3 = Math.max(14, Math.round(Math.min(W, H) * 0.045));
-  const blr1 = boxBlur(g, R1);
-  const blr2 = boxBlur(g, R2);
-  const blr3 = boxBlur(g, R3);
+  // 2) Sobelフィルタでエッジ強度と方向を計算
+  const mag = new Float32Array(W * H);
+  const ang = new Float32Array(W * H);
+  for (let y = 1; y < H-1; y++) {
+    for (let x = 1; x < W-1; x++) {
+      const gx = -g[(y-1)*W+(x-1)] - 2*g[y*W+(x-1)] - g[(y+1)*W+(x-1)]
+                + g[(y-1)*W+(x+1)] + 2*g[y*W+(x+1)] + g[(y+1)*W+(x+1)];
+      const gy = -g[(y-1)*W+(x-1)] - 2*g[(y-1)*W+x] - g[(y-1)*W+(x+1)]
+                + g[(y+1)*W+(x-1)] + 2*g[(y+1)*W+x] + g[(y+1)*W+(x+1)];
+      mag[y*W+x] = Math.sqrt(gx*gx + gy*gy);
+      ang[y*W+x] = Math.atan2(gy, gx);
+    }
+  }
 
-  // 手のバウンディングボックス（ランドマークあれば手の範囲に限定、なければ全体）
-  let hMinX = 0, hMaxX = W, hMinY = 0, hMaxY = H;
+  // 3) 手の範囲を決定
+  let hMinX = 1, hMaxX = W-1, hMinY = 1, hMaxY = H-1;
   if (lm) {
-    const p = lm.map(l => ({x: l.x * W, y: l.y * H}));
-    const allX = p.map(pt => pt.x), allY = p.map(pt => pt.y);
-    hMinX = Math.max(0, Math.min(...allX) - 20);
-    hMaxX = Math.min(W, Math.max(...allX) + 20);
-    hMinY = Math.max(0, Math.min(...allY) - 20);
-    hMaxY = Math.min(H, Math.max(...allY) + 20);
+    const p = lm.map(l => ({x: l.x*W, y: l.y*H}));
+    const allX = p.map(pt=>pt.x), allY = p.map(pt=>pt.y);
+    hMinX = Math.max(1, Math.min(...allX) - 15);
+    hMaxX = Math.min(W-1, Math.max(...allX) + 15);
+    hMinY = Math.max(1, Math.min(...allY) - 15);
+    hMaxY = Math.min(H-1, Math.max(...allY) + 15);
   }
 
-  // シワスコアマップ: 3段階スケール最大値
-  const score = new Float32Array(W * H);
-  for (let i = 0; i < W * H; i++) {
-    const s1 = blr1[i] - g[i];
-    const s2 = blr2[i] - g[i];
-    const s3 = blr3[i] - g[i];
-    score[i] = Math.max(s1, s2, s3);
-  }
-
-  // 非最大値抑制（NMS）: 8近傍で局所最大のピクセルのみ残す → シワが細く鮮明になる
-  const thr = 3.5, range = 18;
-  const id = new ImageData(W, H);
+  // 4) 方向別NMS: エッジ方向に垂直な隣接ピクセルより大きければ残す
+  // → 1ピクセル幅の正確なエッジ線になる
+  const palmW = hMaxX - hMinX;
+  // 閾値: 画像の解像度に応じて調整（手のひらの細かいシワを捉えるため低めに）
+  const loThr = Math.max(8, palmW * 0.03);
+  const hiThr = Math.max(20, palmW * 0.08);
+  const thin = new Float32Array(W * H);
 
   for (let y = ~~hMinY + 1; y < ~~hMaxY - 1; y++) {
     for (let x = ~~hMinX + 1; x < ~~hMaxX - 1; x++) {
-      const sc = score[y * W + x];
-      if (sc <= thr) continue;
-      // 8近傍の最大値より大きければ局所最大
-      const neighbors = [
-        score[(y-1)*W+(x-1)], score[(y-1)*W+x], score[(y-1)*W+(x+1)],
-        score[y*W+(x-1)],                         score[y*W+(x+1)],
-        score[(y+1)*W+(x-1)], score[(y+1)*W+x], score[(y+1)*W+(x+1)],
-      ];
-      if (sc < Math.max(...neighbors)) continue; // 局所最大でなければスキップ
-      const a = Math.min(255, Math.round((sc - thr) / range * 255));
-      const idx = (y * W + x) * 4;
+      const m = mag[y*W+x];
+      if (m < loThr) continue;
+      // エッジ方向を4方向に量子化して隣接比較
+      const a = ang[y*W+x];
+      let n1, n2;
+      const ad = ((a * 180 / Math.PI) + 180) % 180;
+      if (ad < 22.5 || ad >= 157.5) {
+        n1 = mag[y*W+(x-1)]; n2 = mag[y*W+(x+1)];
+      } else if (ad < 67.5) {
+        n1 = mag[(y-1)*W+(x+1)]; n2 = mag[(y+1)*W+(x-1)];
+      } else if (ad < 112.5) {
+        n1 = mag[(y-1)*W+x]; n2 = mag[(y+1)*W+x];
+      } else {
+        n1 = mag[(y-1)*W+(x-1)]; n2 = mag[(y+1)*W+(x+1)];
+      }
+      if (m >= n1 && m >= n2) thin[y*W+x] = m;
+    }
+  }
+
+  // 5) ダブル閾値 + エッジ連結（弱いエッジを強いエッジに隣接する場合のみ保持）
+  const id = new ImageData(W, H);
+  const strong = new Uint8Array(W * H);
+  const weak   = new Uint8Array(W * H);
+  for (let i = 0; i < W*H; i++) {
+    if (thin[i] >= hiThr)      strong[i] = 1;
+    else if (thin[i] >= loThr) weak[i]   = 1;
+  }
+  // 弱いエッジを連結（8近傍に強エッジがあれば採用）
+  for (let y = ~~hMinY+1; y < ~~hMaxY-1; y++) {
+    for (let x = ~~hMinX+1; x < ~~hMaxX-1; x++) {
+      if (!weak[y*W+x]) continue;
+      const hasStrong =
+        strong[(y-1)*W+(x-1)] || strong[(y-1)*W+x] || strong[(y-1)*W+(x+1)] ||
+        strong[y*W+(x-1)]     ||                       strong[y*W+(x+1)]     ||
+        strong[(y+1)*W+(x-1)] || strong[(y+1)*W+x] || strong[(y+1)*W+(x+1)];
+      if (hasStrong) strong[y*W+x] = 1;
+    }
+  }
+
+  // 6) 最終描画: 強エッジを赤で描画
+  for (let y = ~~hMinY; y < ~~hMaxY; y++) {
+    for (let x = ~~hMinX; x < ~~hMaxX; x++) {
+      if (!strong[y*W+x]) continue;
+      const norm = Math.min(1, (thin[y*W+x] - loThr) / (hiThr * 2));
+      const a = Math.round(200 + norm * 55);
+      const idx = (y*W+x)*4;
       id.data[idx]   = 255;
-      id.data[idx+1] = 15;
-      id.data[idx+2] = 15;
-      id.data[idx+3] = Math.max(180, a); // 最低でも70%の不透明度で鮮明に
+      id.data[idx+1] = 30;
+      id.data[idx+2] = 30;
+      id.data[idx+3] = a;
     }
   }
   return id;
