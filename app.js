@@ -695,6 +695,74 @@ function calcCreasePaths(lm, canvas) {
   };
 }
 
+// ===================== CREASE OVERLAY =====================
+let creaseOverlayCache = null;
+
+// 手のひら全体の細かいシワをピクセルレベルで ImageData に変換
+function computeCreaseOverlay(canvas, lm) {
+  const W = canvas.width, H = canvas.height;
+  const g = getGrayData(canvas);
+
+  // 細かいシワ用に小さいブラー半径（主要線検出より細かく）
+  const R = Math.max(4, Math.round(Math.min(W, H) * 0.012));
+  const tmp = new Float32Array(W * H);
+  const blr = new Float32Array(W * H);
+
+  // セパラブル ボックスブラー（水平）
+  for (let y = 0; y < H; y++) {
+    let s = 0, lo = 0, hi = 0;
+    for (let x = 0; x < W; x++) {
+      while (hi <= Math.min(x + R, W - 1)) { s += g[y * W + hi]; hi++; }
+      while (lo < Math.max(0, x - R))      { s -= g[y * W + lo]; lo++; }
+      tmp[y * W + x] = s / (hi - lo);
+    }
+  }
+  // セパラブル ボックスブラー（垂直）
+  for (let x = 0; x < W; x++) {
+    let s = 0, lo = 0, hi = 0;
+    for (let y = 0; y < H; y++) {
+      while (hi <= Math.min(y + R, H - 1)) { s += tmp[hi * W + x]; hi++; }
+      while (lo < Math.max(0, y - R))      { s -= tmp[lo * W + x]; lo++; }
+      blr[y * W + x] = s / (hi - lo);
+    }
+  }
+
+  // 手のバウンディングボックス（手の外のノイズを除去）
+  const p = lm.map(l => ({x: l.x * W, y: l.y * H}));
+  const allX = p.map(pt => pt.x), allY = p.map(pt => pt.y);
+  const hMinX = Math.max(0,  Math.min(...allX) - 12);
+  const hMaxX = Math.min(W,  Math.max(...allX) + 12);
+  const hMinY = Math.max(0,  Math.min(...allY) - 12);
+  const hMaxY = Math.min(H,  Math.max(...allY) + 12);
+
+  // シワらしさ = 局所平均 − 自身の輝度
+  const id = new ImageData(W, H);
+  const thr = 7, range = 28;
+
+  for (let y = ~~hMinY; y < ~~hMaxY; y++) {
+    for (let x = ~~hMinX; x < ~~hMaxX; x++) {
+      const score = blr[y * W + x] - g[y * W + x];
+      if (score > thr) {
+        const a = Math.min(240, Math.round((score - thr) / range * 240));
+        const i = (y * W + x) * 4;
+        id.data[i]   = 255;  // R
+        id.data[i+1] = 30;   // G
+        id.data[i+2] = 30;   // B
+        id.data[i+3] = a;
+      }
+    }
+  }
+  return id;
+}
+
+function applyCreaseOverlay(ctx, W, H) {
+  if (!creaseOverlayCache) return;
+  const tmp = document.createElement('canvas');
+  tmp.width = W; tmp.height = H;
+  tmp.getContext('2d').putImageData(creaseOverlayCache, 0, 0);
+  ctx.drawImage(tmp, 0, 0);
+}
+
 // ===================== CANVAS =====================
 function drawCanvas() {
   const canvas = document.getElementById('palmCanvas');
@@ -705,17 +773,23 @@ function drawCanvas() {
     alert('画像を読み込めませんでした。\nJPEGまたはPNG形式の写真をお試しください。');
   };
   img.onload = async () => {
-    const maxW = Math.min(img.width, 800);
+    const maxW = Math.min(img.width, 900);
     const scale = maxW / img.width;
     canvas.width  = img.width  * scale;
     canvas.height = img.height * scale;
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-    // 1) Detect hand landmarks
+    // 1) ランドマーク検出
     const lm = await detectLandmarks(img);
-    // 2) If found: run image-analysis crease detection
     detectedLandmarkPaths = lm ? calcCreasePaths(lm, canvas) : null;
 
+    // 2) 全シワをピクセルレベルで描画（細かいシワも含む）
+    if (lm) {
+      creaseOverlayCache = computeCreaseOverlay(canvas, lm);
+      applyCreaseOverlay(ctx, canvas.width, canvas.height);
+    }
+
+    // 3) 主要な名前付き線をラベル付きで重ねる
     PALM_LINES.forEach((l, i) =>
       setTimeout(() => { if (lineVis[l.id]) drawLine(ctx, l, canvas.width, canvas.height); }, i * 100)
     );
@@ -725,18 +799,17 @@ function drawCanvas() {
 }
 
 function drawLine(ctx, line, cw, ch) {
-  // Use landmark-based path if available, otherwise fallback to fixed %
   const pts = detectedLandmarkPaths && detectedLandmarkPaths[line.id]
     ? detectedLandmarkPaths[line.id]
     : line.path.map(([x,y]) => ({ x: x/100*cw, y: y/100*ch }));
 
   ctx.save();
-  ctx.strokeStyle = '#ff3333';
-  ctx.lineWidth = Math.max(2.5, cw / 180);
+  ctx.strokeStyle = '#ff2222';
+  ctx.lineWidth = Math.max(2, cw / 220);
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  ctx.shadowColor = 'rgba(255,50,50,0.7)';
-  ctx.shadowBlur = 12;
+  ctx.shadowColor = 'rgba(255,30,30,0.85)';
+  ctx.shadowBlur = 8;
   ctx.setLineDash(line.dash || []);
 
   ctx.beginPath();
@@ -754,16 +827,16 @@ function drawLine(ctx, line, cw, ch) {
   }
   ctx.stroke();
 
-  // Label at last point
+  // ラベル
   const last = pts[pts.length-1];
   ctx.setLineDash([]);
   ctx.shadowBlur = 0;
-  const fs = Math.max(9, cw / 80);
+  const fs = Math.max(9, cw / 85);
   ctx.font = `bold ${fs}px sans-serif`;
   const tw = ctx.measureText(line.name).width;
-  ctx.fillStyle = 'rgba(0,0,0,0.72)';
+  ctx.fillStyle = 'rgba(0,0,0,0.78)';
   ctx.fillRect(last.x - tw/2 - 3, last.y - fs - 2, tw + 6, fs + 6);
-  ctx.fillStyle = '#ffbbbb';
+  ctx.fillStyle = '#ffcccc';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'alphabetic';
   ctx.fillText(line.name, last.x, last.y + 1);
@@ -777,6 +850,8 @@ function redrawCanvas() {
   img.onload = () => {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    // キャッシュ済みシワオーバーレイを再利用（再計算なし）
+    applyCreaseOverlay(ctx, canvas.width, canvas.height);
     PALM_LINES.forEach((l, i) =>
       setTimeout(() => { if (lineVis[l.id]) drawLine(ctx, l, canvas.width, canvas.height); }, i * 80)
     );
