@@ -390,6 +390,18 @@ body {
   color: var(--text2);
 }
 
+.legend-section-label {
+  font-size: 0.70rem;
+  font-weight: 600;
+  color: var(--gold2);
+  letter-spacing: 0.03em;
+  margin-top: 0.4rem;
+  margin-bottom: 0.2rem;
+}
+.legend-section-label.absent {
+  color: var(--text2);
+  font-weight: 500;
+}
 .line-icons-row {
   display: flex;
   flex-wrap: wrap;
@@ -405,9 +417,18 @@ body {
   border: 1px solid var(--border);
   border-radius: 20px;
   padding: 0.25rem 0.6rem;
+  transition: opacity 0.2s;
+}
+.line-icon-chip.detected {
+  background: rgba(212,168,67,0.10);
+  border-color: rgba(212,168,67,0.30);
+}
+.line-icon-chip.detected .line-chip-name { color: var(--text); }
+.line-icon-chip.absent {
+  opacity: 0.45;
 }
 .line-chip-icon { font-size: 0.85rem; }
-.line-chip-name { color: var(--text); }
+.line-chip-name { color: var(--text2); }
 
 /* ===================== SCORES GRID ===================== */
 .scores-grid {
@@ -553,6 +574,44 @@ body {
 
 .future-body h4 { font-size: 0.85rem; font-weight: 700; color: var(--gold2); margin-bottom: 0.4rem; }
 .future-body p { font-size: 0.79rem; color: #ccc8c0; line-height: 1.8; user-select: text; }
+
+/* ===================== MOUNTS SECTION ===================== */
+.mounts-section { display: flex; flex-direction: column; gap: 0.5rem; }
+
+.mount-card {
+  background: var(--surface2);
+  border: 1px solid rgba(255,255,255,0.09);
+  border-radius: 14px;
+  overflow: hidden;
+  transition: border-color 0.2s;
+}
+.mount-card.open { border-color: rgba(212,168,67,0.35); }
+
+.mount-card-header {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.75rem 0.9rem;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.mount-icon { font-size: 1.4rem; flex-shrink:0; width:2rem; text-align:center; }
+.mount-titles { flex:1; min-width:0; }
+.mount-name { font-size:0.88rem; font-weight:700; color:var(--text); }
+.mount-keyword { font-size:0.68rem; color:var(--text2); margin:0.1rem 0 0.25rem; }
+.mount-level-badge {
+  display:inline-block; font-size:0.6rem; font-weight:700;
+  padding:1px 8px; border-radius:20px; letter-spacing:0.04em;
+}
+.mount-level-badge.level-発達 { background:rgba(212,168,67,0.18); border:1px solid rgba(212,168,67,0.4); color:var(--gold); }
+.mount-level-badge.level-普通 { background:rgba(255,255,255,0.07); border:1px solid var(--border); color:var(--text2); }
+.mount-level-badge.level-平坦 { background:rgba(120,120,200,0.15); border:1px solid rgba(120,120,200,0.3); color:#aab; }
+.mount-arrow { font-size:1.2rem; color:var(--gold); flex-shrink:0; transition:transform 0.2s; line-height:1; }
+.mount-card.open .mount-arrow { transform:rotate(90deg); }
+
+.mount-body { padding:0 0.9rem 0.9rem; border-top:1px solid rgba(255,255,255,0.06); padding-top:0.75rem; }
+.mount-zone { font-size:0.68rem; color:var(--text2); margin-bottom:0.5rem; }
+.mount-text { font-size:0.79rem; color:#ccc8c0; line-height:1.85; user-select:text; }
 
 /* ===================== LIFE READINGS CARDS ===================== */
 .life-section-label { margin-top: 1.6rem; }
