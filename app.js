@@ -682,12 +682,43 @@ const LIFE_READINGS = [
 
 let lifeReadingData = {}; // 各カテゴリで選ばれたvariation
 
+// ===================== SEEDED RNG =====================
+// 同じ写真は常に同じ鑑定結果を返すための決定論的乱数生成器
+class SeededRNG {
+  constructor(seed) { this.s = (seed >>> 0) || 0xDEADBEEF; }
+  next() {
+    // xorshift32
+    this.s ^= this.s << 13;
+    this.s ^= this.s >>> 17;
+    this.s ^= this.s << 5;
+    return (this.s >>> 0) / 4294967296;
+  }
+  pick(arr) { return arr[Math.floor(this.next() * arr.length)]; }
+  bool(prob) { return this.next() < prob; }
+}
+
+// 画像のピクセルデータからシード値を生成（同じ画像→同じシード）
+function hashImageSeed(canvas) {
+  const ctx = canvas.getContext('2d');
+  const W = Math.min(canvas.width, 80);
+  const H = Math.min(canvas.height, 80);
+  const data = ctx.getImageData(0, 0, W, H).data;
+  let h = 2166136261 >>> 0; // FNV-1a
+  for (let i = 0; i < data.length; i += 4) {
+    h = Math.imul(h ^ data[i],   16777619) >>> 0;
+    h = Math.imul(h ^ data[i+1], 16777619) >>> 0;
+    h = Math.imul(h ^ data[i+2], 16777619) >>> 0;
+  }
+  return h;
+}
+
 // ===================== STATE =====================
 let imgSrc = null;
 let lineVis = {};
 let scores = {};
 let readingTexts = {};
 let currentTab = 'Lines';
+let storedLandmarks = null; // analyzeImage で検出したランドマーク（drawCanvas で再利用）
 
 // ===================== INIT =====================
 document.addEventListener('DOMContentLoaded', () => {
@@ -764,54 +795,276 @@ async function loadFile(file) {
 }
 
 // ===================== ANALYSIS =====================
-function runAnalysis() {
+async function runAnalysis() {
   showLoading();
-  generateData();
+  storedLandmarks = null; // リセット
 
   const steps = [
     '手のひらの輪郭を検出中...',
-    '主要な掌紋を認識中...',
-    '生命線・感情線を解析中...',
-    '特殊線（モテ線・金運線）を探索中...',
+    '指と手首の座標を特定中...',
+    '生命線・感情線・知能線を解析中...',
+    'シワの密度マップを生成中...',
+    '特殊線（金運・直感・旅行線など）を探索中...',
+    '丘と平原の発達度を測定中...',
     '人格パターンを分析中...',
     '運命の流れを読み解いています...',
   ];
 
   const stepEl = document.getElementById('loadingStep');
   const progressEl = document.getElementById('progressBar');
-  let i = 0;
 
-  const tick = () => {
-    if (i < steps.length) {
-      stepEl.textContent = steps[i];
-      progressEl.style.width = ((i + 1) / steps.length * 100) + '%';
-      i++;
-      setTimeout(tick, 500);
-    } else {
-      setTimeout(() => {
-        hideLoading();
-        showResult();
-      }, 400);
-    }
-  };
-  tick();
+  // アニメーションを Promise 化
+  const animPromise = new Promise(resolve => {
+    let i = 0;
+    const tick = () => {
+      if (i < steps.length) {
+        stepEl.textContent = steps[i];
+        progressEl.style.width = ((i + 1) / steps.length * 100) + '%';
+        i++;
+        setTimeout(tick, 450);
+      } else {
+        setTimeout(resolve, 300);
+      }
+    };
+    tick();
+  });
+
+  // 画像解析を並列実行（ローディング中にバックグラウンドで処理）
+  const analysisPromise = analyzeImage();
+
+  // 両方完了するまで待機
+  const [analysisData] = await Promise.all([analysisPromise, animPromise]);
+
+  generateData(analysisData);
+  hideLoading();
+  showResult();
 }
 
-function generateData() {
-  PALM_LINES.forEach(l => {
-    // 確率に基づいて各線の「検出」を決定
-    lineVis[l.id] = Math.random() < l.prob;
-    const d = READINGS[l.id];
-    scores[l.id] = d.scores[Math.floor(Math.random() * d.scores.length)];
-    readingTexts[l.id] = d.texts[Math.floor(Math.random() * d.texts.length)];
+// ── 画像解析メイン ───────────────────────────────────────
+async function analyzeImage() {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = async () => {
+      // 解析用は速度重視で480pxにリサイズ
+      const maxW = Math.min(img.width, 480);
+      const scale = maxW / img.width;
+      const canvas = document.createElement('canvas');
+      canvas.width  = img.width  * scale;
+      canvas.height = img.height * scale;
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+
+      // 画像ハッシュからシード生成（同じ写真→同じ結果）
+      const seed = hashImageSeed(canvas);
+      const rng  = new SeededRNG(seed);
+
+      // MediaPipe でランドマーク検出
+      let lm = null;
+      try { lm = await detectLandmarks(img); } catch(e) { /* 検出失敗は無視 */ }
+      storedLandmarks = lm; // drawCanvas で再利用
+
+      // クリースマップ + ゾーン解析
+      let lineScores  = {};
+      let mountLevels = {};
+      if (lm) {
+        const creaseMap = getCreaseMap(canvas);
+        lineScores  = computeLineScores(canvas, lm, creaseMap);
+        mountLevels = computeMountLevels(canvas, lm, creaseMap);
+      }
+
+      resolve({ rng, lm, lineScores, mountLevels });
+    };
+    img.onerror = () => {
+      resolve({ rng: new SeededRNG(Date.now()), lm: null, lineScores: {}, mountLevels: {} });
+    };
+    img.src = imgSrc;
   });
+}
+
+// ── クリースマップのゾーン平均スコア ─────────────────────
+function zoneScore(c, W, H, x0, x1, y0, y1) {
+  x0 = Math.max(0, Math.round(x0)); x1 = Math.min(W, Math.round(x1));
+  y0 = Math.max(0, Math.round(y0)); y1 = Math.min(H, Math.round(y1));
+  if (x0 >= x1 || y0 >= y1) return 0;
+  let s = 0, n = 0;
+  for (let y = y0; y < y1; y++)
+    for (let x = x0; x < x1; x++) { s += c[y * W + x]; n++; }
+  return n ? s / n : 0;
+}
+
+// ── 各手相線のシワ密度ゾーン解析 ─────────────────────────
+function computeLineScores(canvas, lm, creaseMap) {
+  const W = canvas.width, H = canvas.height;
+  const p = lm.map(l => ({ x: l.x * W, y: l.y * H }));
+  const fingerBaseY = Math.min(p[5].y, p[9].y, p[13].y, p[17].y);
+  const wristY      = p[0].y;
+  const palmH       = Math.abs(wristY - fingerBaseY);
+  const flip        = p[5].x > p[17].x;
+  const thumbSideX  = flip ? Math.max(p[1].x, p[2].x) : Math.min(p[1].x, p[2].x);
+  const pinkySideX  = p[17].x;
+  const xLeft       = Math.min(thumbSideX, pinkySideX);
+  const xRight      = Math.max(thumbSideX, pinkySideX);
+  const palmW       = xRight - xLeft;
+  const cx          = (xLeft + xRight) / 2;
+
+  const sc = {}; // 各線のシワスコア
+  const zs = (x0,x1,y0,y1) => zoneScore(creaseMap, W, H, x0, x1, y0, y1);
+
+  // 基本三大線（常に存在）
+  sc.life  = 99; sc.head = 99; sc.heart = 99;
+
+  // 運命線: 手のひら中央縦ゾーン
+  sc.fate = zs(cx-palmW*.12, cx+palmW*.12, fingerBaseY+palmH*.1, wristY-palmH*.05);
+
+  // 太陽線: 薬指直下縦ゾーン
+  sc.sun = zs(p[13].x-palmW*.09, p[13].x+palmW*.09, fingerBaseY+.05*palmH, fingerBaseY+.6*palmH);
+
+  // 結婚線: 小指外縁の横ゾーン
+  const outerX = flip ? xRight - palmW*.18 : xLeft + palmW*.18;
+  sc.marriage = zs(Math.min(outerX,p[17].x), Math.max(outerX,p[17].x)+palmW*.1,
+                   fingerBaseY, fingerBaseY+palmH*.22);
+
+  // 健康線: 小指側から中央への斜めゾーン
+  sc.health = zs((cx+pinkySideX)/2-palmW*.12, (cx+pinkySideX)/2+palmW*.1,
+                 fingerBaseY+palmH*.25, wristY-palmH*.08);
+
+  // 金運線: 中指〜薬指間縦ゾーン
+  const monX = (p[9].x + p[13].x) / 2;
+  sc.money = zs(monX-palmW*.08, monX+palmW*.08, fingerBaseY+palmH*.2, fingerBaseY+palmH*.65);
+
+  // 人気線: 薬指〜小指間上部
+  const popX = (p[13].x + p[17].x) / 2;
+  sc.popular = zs(popX-palmW*.07, popX+palmW*.07, fingerBaseY, fingerBaseY+palmH*.45);
+
+  // モテ線: 人差し指〜中指間
+  const chX = (p[5].x + p[9].x) / 2;
+  sc.charm = zs(chX-palmW*.07, chX+palmW*.07, fingerBaseY+palmH*.2, fingerBaseY+palmH*.55);
+
+  // つくし線: 親指付け根内側
+  sc.devotion = zs(thumbSideX-palmW*.03, thumbSideX+palmW*.17,
+                   fingerBaseY+palmH*.35, fingerBaseY+palmH*.65);
+
+  // 子供線: 結婚線ゾーンの縦方向
+  sc.children = zs(p[17].x-palmW*.12, p[17].x+palmW*.12,
+                   fingerBaseY-palmH*.1, fingerBaseY+palmH*.05);
+
+  // 努力線: 運命線左横の縦ゾーン
+  sc.effort = zs(cx-palmW*.22, cx-palmW*.04, fingerBaseY+palmH*.15, wristY-palmH*.1);
+
+  // 変化線: 生命線下部から外側への横ゾーン
+  sc.change = zs(thumbSideX-palmW*.05, thumbSideX+palmW*.28,
+                 wristY-palmH*.3, wristY-palmH*.05);
+
+  // 旅行線: 生命線最下部から横方向
+  sc.travel = zs(thumbSideX, thumbSideX+palmW*.3, wristY-palmH*.18, wristY);
+
+  // 直感線: 月丘の弧状ゾーン（小指側下部）
+  const lunaX = pinkySideX + (flip ? palmW*.04 : -palmW*.04);
+  sc.intuition = zs(lunaX-palmW*.08, lunaX+palmW*.06,
+                    fingerBaseY+palmH*.55, wristY-palmH*.02);
+
+  // 姉妹線: 生命線内側に平行
+  sc.sister = zs(thumbSideX+palmW*.06, thumbSideX+palmW*.18,
+                 fingerBaseY+palmH*.15, fingerBaseY+palmH*.65);
+
+  // 火星線: 生命線のさらに内側
+  sc.mars_inner = zs(thumbSideX-palmW*.02, thumbSideX+palmW*.1,
+                     fingerBaseY+palmH*.22, fingerBaseY+palmH*.7);
+
+  // 独立線: 手首直上の短い縦ゾーン
+  sc.independence = zs(cx-palmW*.1, cx+palmW*.1, wristY-palmH*.18, wristY);
+
+  // 金星帯: 感情線上部の弧ゾーン（指付け根直下）
+  sc.venus_girdle = zs(xLeft+palmW*.15, xRight-palmW*.15,
+                       fingerBaseY-palmH*.06, fingerBaseY+palmH*.1);
+
+  // 海外運線: 月丘下部から手首方向
+  sc.foreign = zs(lunaX-palmW*.09, lunaX+palmW*.06,
+                  wristY-palmH*.28, wristY-palmH*.04);
+
+  // 神秘十字線: 知能線〜感情線の中間クロスゾーン
+  sc.mystic = zs(cx-palmW*.18, cx+palmW*.18,
+                 fingerBaseY+palmH*.17, fingerBaseY+palmH*.36);
+
+  // 障害線: 主要線を横切るゾーン全体
+  sc.obstacle = zs(xLeft, xRight, fingerBaseY+palmH*.24, fingerBaseY+palmH*.54);
+
+  return sc;
+}
+
+// ── 各丘・平原のシワ密度からレベルを判定 ─────────────────
+function computeMountLevels(canvas, lm, creaseMap) {
+  const W = canvas.width, H = canvas.height;
+  const p = lm.map(l => ({ x: l.x * W, y: l.y * H }));
+  const fingerBaseY = Math.min(p[5].y, p[9].y, p[13].y, p[17].y);
+  const wristY      = p[0].y;
+  const palmH       = Math.abs(wristY - fingerBaseY);
+  const flip        = p[5].x > p[17].x;
+  const thumbSideX  = flip ? Math.max(p[1].x, p[2].x) : Math.min(p[1].x, p[2].x);
+  const pinkySideX  = p[17].x;
+  const xLeft       = Math.min(thumbSideX, pinkySideX);
+  const xRight      = Math.max(thumbSideX, pinkySideX);
+  const palmW       = xRight - xLeft;
+  const cx          = (xLeft + xRight) / 2;
+  const MR          = palmW * 0.13;
+  const zs = (x0,x1,y0,y1) => zoneScore(creaseMap, W, H, x0, x1, y0, y1);
+
+  const raw = {
+    jupiter:   zs(p[5].x-MR,  p[5].x+MR,  fingerBaseY-palmH*.06, fingerBaseY+palmH*.14),
+    saturn:    zs(p[9].x-MR,  p[9].x+MR,  fingerBaseY-palmH*.06, fingerBaseY+palmH*.14),
+    sun_mount: zs(p[13].x-MR, p[13].x+MR, fingerBaseY-palmH*.06, fingerBaseY+palmH*.14),
+    mercury:   zs(p[17].x-MR, p[17].x+MR, fingerBaseY-palmH*.06, fingerBaseY+palmH*.14),
+    mars1:     zs(thumbSideX-MR*.5, thumbSideX+MR*1.8, fingerBaseY+palmH*.06, fingerBaseY+palmH*.26),
+    mars2:     zs(pinkySideX-MR*1.8, pinkySideX+MR*.5, fingerBaseY+palmH*.24, fingerBaseY+palmH*.56),
+    venus:     zs(thumbSideX-MR*.3,  thumbSideX+MR*2.2, fingerBaseY+palmH*.22, wristY-palmH*.08),
+    luna:      zs(pinkySideX-MR*2.0, pinkySideX+MR*.4, fingerBaseY+palmH*.52, wristY-palmH*.04),
+    plain:     zs(cx-palmW*.22, cx+palmW*.22, fingerBaseY+palmH*.28, fingerBaseY+palmH*.66),
+  };
+
+  // 全丘のスコアを3分位で発達/普通/平坦に分類
+  const vals = Object.values(raw).sort((a, b) => a - b);
+  const lo = vals[Math.floor(vals.length * 0.33)];
+  const hi = vals[Math.floor(vals.length * 0.67)];
+  const levels = {};
+  for (const [id, score] of Object.entries(raw)) {
+    levels[id] = score >= hi ? '発達' : score >= lo ? '普通' : '平坦';
+  }
+  return levels;
+}
+
+function generateData({ rng = new SeededRNG(Date.now()), lineScores = {}, mountLevels = {} } = {}) {
+  PALM_LINES.forEach(l => {
+    if (l.prob >= 1.0) {
+      lineVis[l.id] = true; // 基本三大線は必ず表示
+    } else {
+      const imgScore = lineScores[l.id];
+      if (imgScore !== undefined && imgScore > 0) {
+        // 画像のシワスコアを正規化して検出確率に反映（0〜15程度のスコアを0〜1に）
+        const normalized = Math.min(1, imgScore / 12);
+        // 解析スコア60% + 線種固有確率40% のブレンド
+        const blendedProb = normalized * 0.60 + l.prob * 0.40;
+        lineVis[l.id] = rng.bool(blendedProb);
+      } else {
+        lineVis[l.id] = rng.bool(l.prob);
+      }
+    }
+    const d = READINGS[l.id];
+    scores[l.id]      = rng.pick(d.scores);
+    readingTexts[l.id] = rng.pick(d.texts);
+  });
+
   // 人生詳細鑑定データの生成
   LIFE_READINGS.forEach(cat => {
-    lifeReadingData[cat.id] = cat.variations[Math.floor(Math.random() * cat.variations.length)];
+    lifeReadingData[cat.id] = rng.pick(cat.variations);
   });
-  // 丘と平原の鑑定データ生成
+
+  // 丘と平原: 画像から判定したレベルを優先、なければシード乱数
   MOUNTS.forEach(m => {
-    mountReadings[m.id] = m.readings[Math.floor(Math.random() * m.readings.length)];
+    const level = mountLevels[m.id];
+    if (level) {
+      mountReadings[m.id] = m.readings.find(r => r.level === level) || rng.pick(m.readings);
+    } else {
+      mountReadings[m.id] = rng.pick(m.readings);
+    }
   });
 }
 
@@ -1235,8 +1488,8 @@ function drawCanvas() {
     canvas.height = img.height * scale;
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-    // ランドマーク検出（鑑定精度向上のために使用）
-    const lm = await detectLandmarks(img);
+    // analyzeImage でランドマーク取得済みならそれを再利用（2重検出を防ぐ）
+    const lm = storedLandmarks !== null ? storedLandmarks : await detectLandmarks(img);
     detectedLandmarkPaths = lm ? calcCreasePaths(lm, canvas) : null;
 
     // 手が検出された場合、手のひら領域をソフトに強調（写真をそのまま表示）
@@ -1618,6 +1871,7 @@ function resetToUpload() {
   lifeReadingData = {};
   mountReadings = {};
   detectedLandmarkPaths = null;
+  storedLandmarks = null;
 }
 
 // ===================== LOADING =====================
